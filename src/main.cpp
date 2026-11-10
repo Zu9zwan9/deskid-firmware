@@ -1,0 +1,1593 @@
+#if defined(DESKID_PRODUCTION) && defined(DESKID_BRINGUP_NO_SENSOR)
+#error "DESKID_BRINGUP_NO_SENSOR must never reach a production image"
+#endif
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+#include "ccid_device.h"
+#include "deskid_core.h"
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "esp_check.h"
+#include "esp_efuse.h"
+#include "esp_random.h"
+#include "esp_secure_boot.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "psa/crypto.h"
+#include "soc/rtc_cntl_reg.h"
+
+namespace {
+
+constexpr char kFirmwareVersion[] = "0.1.0";
+#if defined(DESKID_PRODUCTION)
+constexpr uint8_t kBuildVariant = 0;
+#elif defined(DESKID_BRINGUP_NO_SENSOR)
+constexpr uint8_t kBuildVariant = 2;
+#else
+constexpr uint8_t kBuildVariant = 1;
+#endif
+constexpr gpio_num_t kFingerprintReceivePin = GPIO_NUM_43;
+constexpr gpio_num_t kFingerprintTransmitPin = GPIO_NUM_44;
+constexpr gpio_num_t kFingerprintWakePin = GPIO_NUM_4;
+constexpr uart_port_t kFingerprintUart = UART_NUM_1;
+constexpr uint32_t kFingerprintBaudRate = 57600;
+constexpr uint16_t kFingerprintCapacity = 200;
+constexpr uint32_t kAuthenticationTimeoutMilliseconds = 30000;
+// Touch ID is never "off": the button is live before anything asks, and the
+// asking is what happens afterwards. DeskID matches that by scanning the ring
+// whenever it is otherwise idle and keeping the result for this long. macOS
+// draws its own PIN field before it ever reaches the card, so without this the
+// user types six meaningless digits at a dark ring and only then gets told to
+// touch it. With it the touch can happen first — on arrival, while the digits
+// are still being typed — and the login APDU is answered with no wait at all.
+//
+// The window is the whole security trade: long enough to cover an unhurried
+// arrival, short enough that a touch left behind is not a standing invitation.
+// It is single use, and only the two login instructions can spend it
+// (deskid::EarlyTouch::maySpend).
+//
+// Measured at the lock screen on 2026-09-02: 15 s covered a deliberate touch,
+// click, six digits and Return, and did not cover the same sequence done at a
+// normal pace. So it is the request window — a touch is good for exactly as
+// long as a request would have waited for one, which is one number to explain
+// rather than two.
+constexpr uint64_t kEarlyTouchValidMilliseconds =
+    kAuthenticationTimeoutMilliseconds;
+// Idle scan cadence. The scan runs off the R503's WAKEUP line and nothing
+// else: that pin is a touch-sense output the sensor drives high for about 5 uA,
+// so watching it costs one GPIO read.
+//
+// The obvious fallback — GenImg over UART, the way fingerPresent() probes
+// during an authentication — must not be used here. GenImg is a full image
+// capture: it powers the imaging array and the sensor LED. Inside a 30 s
+// authentication window that is what it is for; four times a second forever it
+// browned the 3V3 rail out badly enough to power-cycle the board and leave the
+// R503 unauthenticated (measured 2026-09-02: `reset reason 1 (power-on)`,
+// `sensor 2 (error)`, ring stuck on the last LED command that got through).
+//
+// So an unsoldered blue wire means no idle scan, and DeskID behaves exactly as
+// it did before: the ring breathes when a request arrives.
+constexpr uint32_t kIdleScanMilliseconds = 40;
+// When the wake line cannot be trusted, the host says when the ring matters —
+// the screen locked, or a password field took focus — and the board watches it
+// with GenImg for a bounded window. Bounded is the whole point: continuously
+// is what browned the rail out, a minute at a time while someone is actually
+// logging in is not.
+constexpr uint32_t kArmedScanMilliseconds = 250;
+constexpr uint8_t kMaximumArmSeconds = 120;
+// The R503's own default. Level 5 is the strictest of the five and was the
+// first choice here, but it rejected an enrolled finger often enough to be
+// unusable: every rejection also spends one of the five attempts before a
+// lockout that survives unplugging, so a strict threshold does not fail
+// gracefully, it fails shut. The false-accept risk it buys back is bounded
+// by that same limiter and by the fact that an attacker must already hold
+// the device.
+constexpr uint8_t kFingerprintSecurityLevel = 3;
+// A held finger gets several captures before it has to lift, the way Touch ID
+// keeps trying: partial contact and a smeared first image are the normal case,
+// not an attack. Every rejected *match* still counts against the rate limiter.
+// Shared by the gated wait and the idle scan — a single-shot idle match
+// rejects ordinary touches that the gated path would have accepted.
+constexpr int kRetriesPerTouch = 3;
+constexpr uint32_t kFingerprintFailureThreshold = 5;
+constexpr uint64_t kFingerprintBaseLockoutMilliseconds = 15000;
+constexpr uint64_t kFingerprintMaximumLockoutMilliseconds = 900000;
+constexpr char kStorageNamespace[] = "deskid";
+constexpr char kCertificateKey[] = "piv_cert";
+constexpr char kPrivateKeyKey[] = "piv_key";
+constexpr char kSensorPasswordKey[] = "finger_pwd";
+constexpr char kSensorReadyKey[] = "finger_ready";
+constexpr char kFailureCountKey[] = "finger_fail";
+constexpr char kLockoutCountKey[] = "finger_lock";
+
+void secureZero(void *data, size_t length) {
+    volatile uint8_t *cursor = static_cast<volatile uint8_t *>(data);
+    while (length-- != 0) {
+        *cursor++ = 0;
+    }
+}
+
+uint64_t millisecondsSinceBoot() {
+    return static_cast<uint64_t>(esp_timer_get_time() / 1000);
+}
+
+struct DerElement {
+    uint8_t tag = 0;
+    const uint8_t *value = nullptr;
+    size_t length = 0;
+};
+
+bool readDerElement(deskid::Bytes encoded, size_t &offset,
+                    DerElement &element) {
+    if (offset + 2 > encoded.size) {
+        return false;
+    }
+    element.tag = encoded.data[offset++];
+    const uint8_t firstLength = encoded.data[offset++];
+    if ((firstLength & 0x80) == 0) {
+        element.length = firstLength;
+    } else {
+        const size_t byteCount = firstLength & 0x7F;
+        if (byteCount == 0 || byteCount > 3 || byteCount > encoded.size - offset) {
+            return false;
+        }
+        element.length = 0;
+        for (size_t index = 0; index < byteCount; ++index) {
+            element.length = (element.length << 8) | encoded.data[offset++];
+        }
+        if (element.length < 0x80) {
+            return false;
+        }
+    }
+    if (element.length > encoded.size - offset) {
+        return false;
+    }
+    element.value = encoded.data + offset;
+    offset += element.length;
+    return true;
+}
+
+bool extractSec1Scalar(deskid::Bytes encoded, uint8_t scalar[32]) {
+    size_t offset = 0;
+    DerElement sequence;
+    if (!readDerElement(encoded, offset, sequence) || sequence.tag != 0x30 ||
+        offset != encoded.size) {
+        return false;
+    }
+
+    deskid::Bytes contents{sequence.value, sequence.length};
+    offset = 0;
+    DerElement version;
+    DerElement privateKey;
+    return readDerElement(contents, offset, version) && version.tag == 0x02 &&
+           readDerElement(contents, offset, privateKey) &&
+           privateKey.tag == 0x04 && privateKey.length == 32 &&
+           (std::memcpy(scalar, privateKey.value, 32), true);
+}
+
+bool extractPrivateScalar(deskid::Bytes encoded, uint8_t scalar[32]) {
+    if (encoded.size == 32) {
+        std::memcpy(scalar, encoded.data, 32);
+        return true;
+    }
+
+    size_t offset = 0;
+    DerElement sequence;
+    if (!readDerElement(encoded, offset, sequence) || sequence.tag != 0x30 ||
+        offset != encoded.size) {
+        return false;
+    }
+    deskid::Bytes contents{sequence.value, sequence.length};
+    offset = 0;
+    DerElement version;
+    DerElement next;
+    if (!readDerElement(contents, offset, version) || version.tag != 0x02 ||
+        !readDerElement(contents, offset, next)) {
+        return false;
+    }
+    if (next.tag == 0x04 && next.length == 32) {
+        std::memcpy(scalar, next.value, 32);
+        return true;
+    }
+    if (next.tag != 0x30) {
+        return false;
+    }
+
+    DerElement wrappedKey;
+    if (!readDerElement(contents, offset, wrappedKey) ||
+        wrappedKey.tag != 0x04) {
+        return false;
+    }
+    return extractSec1Scalar({wrappedKey.value, wrappedKey.length}, scalar);
+}
+
+bool extractCertificatePublicKey(deskid::Bytes certificate,
+                                 uint8_t publicKey[65]) {
+    size_t offset = 0;
+    DerElement certificateSequence;
+    if (!readDerElement(certificate, offset, certificateSequence) ||
+        certificateSequence.tag != 0x30 || offset != certificate.size) {
+        return false;
+    }
+
+    deskid::Bytes certificateContents{certificateSequence.value,
+                                      certificateSequence.length};
+    offset = 0;
+    DerElement tbsCertificate;
+    if (!readDerElement(certificateContents, offset, tbsCertificate) ||
+        tbsCertificate.tag != 0x30) {
+        return false;
+    }
+
+    deskid::Bytes tbs{tbsCertificate.value, tbsCertificate.length};
+    offset = 0;
+    DerElement field;
+    if (!readDerElement(tbs, offset, field)) {
+        return false;
+    }
+    if (field.tag == 0xA0 && !readDerElement(tbs, offset, field)) {
+        return false;
+    }
+    if (field.tag != 0x02) {
+        return false;
+    }
+    for (size_t index = 0; index < 4; ++index) {
+        if (!readDerElement(tbs, offset, field)) {
+            return false;
+        }
+    }
+
+    DerElement subjectPublicKeyInfo;
+    if (!readDerElement(tbs, offset, subjectPublicKeyInfo) ||
+        subjectPublicKeyInfo.tag != 0x30) {
+        return false;
+    }
+    deskid::Bytes spki{subjectPublicKeyInfo.value,
+                       subjectPublicKeyInfo.length};
+    offset = 0;
+    DerElement algorithm;
+    DerElement bitString;
+    if (!readDerElement(spki, offset, algorithm) || algorithm.tag != 0x30 ||
+        !readDerElement(spki, offset, bitString) || bitString.tag != 0x03 ||
+        offset != spki.size || bitString.length != 66 ||
+        bitString.value[0] != 0 || bitString.value[1] != 0x04) {
+        return false;
+    }
+    constexpr uint8_t p256Algorithm[] = {
+        0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01, 0x06,
+        0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07,
+    };
+    if (algorithm.length != sizeof(p256Algorithm) ||
+        std::memcmp(algorithm.value, p256Algorithm,
+                    sizeof(p256Algorithm)) != 0) {
+        return false;
+    }
+    std::memcpy(publicKey, bitString.value + 1, 65);
+    return true;
+}
+
+size_t encodeDerInteger(const uint8_t value[32], uint8_t *destination,
+                        size_t capacity) {
+    size_t first = 0;
+    while (first < 31 && value[first] == 0) {
+        ++first;
+    }
+    const bool leadingZero = (value[first] & 0x80) != 0;
+    const size_t valueLength = 32 - first + (leadingZero ? 1 : 0);
+    if (capacity < valueLength + 2) {
+        return 0;
+    }
+    destination[0] = 0x02;
+    destination[1] = static_cast<uint8_t>(valueLength);
+    size_t offset = 2;
+    if (leadingZero) {
+        destination[offset++] = 0;
+    }
+    std::memcpy(destination + offset, value + first, 32 - first);
+    return valueLength + 2;
+}
+
+class StoredPivCredential final : public deskid::PivCredential {
+public:
+    ~StoredPivCredential() override {
+        if (keyId_ != PSA_KEY_ID_NULL) {
+            psa_destroy_key(keyId_);
+        }
+        if (pendingKeyId_ != PSA_KEY_ID_NULL) {
+            psa_destroy_key(pendingKeyId_);
+        }
+        secureZero(privateKeyDer_.data(), privateKeyDer_.size());
+    }
+
+    esp_err_t initialize() {
+        if (psa_crypto_init() != PSA_SUCCESS) {
+            return ESP_FAIL;
+        }
+
+        nvs_handle_t handle;
+        ESP_RETURN_ON_ERROR(nvs_open(kStorageNamespace, NVS_READWRITE, &handle),
+                            "IDENTITY", "Unable to open credential storage");
+        const esp_err_t result = loadSensorPassword(handle);
+        if (result == ESP_OK) {
+            loadCredential(handle);
+        }
+        nvs_close(handle);
+        return result;
+    }
+
+    deskid::Bytes certificateDer() const override {
+        return {certificate_.data(), certificateLength_};
+    }
+
+    deskid::Bytes deviceIdentifier() const override {
+        if (certificateLength_ == 0) {
+            return {nullptr, 0};
+        }
+        return {identifier_.data(), identifier_.size()};
+    }
+
+    bool signP256Sha256(deskid::Bytes digest, uint8_t *signature,
+                        size_t capacity, size_t &signatureLength) override {
+        signatureLength = 0;
+        if (digest.data == nullptr || digest.size != 32 ||
+            signature == nullptr || capacity < 72 ||
+            keyId_ == PSA_KEY_ID_NULL) {
+            return false;
+        }
+
+        uint8_t rawSignature[64];
+        size_t rawSignatureLength = 0;
+        if (psa_sign_hash(keyId_, PSA_ALG_ECDSA(PSA_ALG_SHA_256),
+                          digest.data, digest.size, rawSignature,
+                          sizeof(rawSignature),
+                          &rawSignatureLength) != PSA_SUCCESS ||
+            rawSignatureLength != sizeof(rawSignature)) {
+            secureZero(rawSignature, sizeof(rawSignature));
+            return false;
+        }
+
+        signature[0] = 0x30;
+        const size_t rLength = encodeDerInteger(rawSignature, signature + 2,
+                                                capacity - 2);
+        const size_t sLength =
+            encodeDerInteger(rawSignature + 32, signature + 2 + rLength,
+                             capacity - 2 - rLength);
+        secureZero(rawSignature, sizeof(rawSignature));
+        if (rLength == 0 || sLength == 0 || rLength + sLength > 0x7F) {
+            return false;
+        }
+        signature[1] = static_cast<uint8_t>(rLength + sLength);
+        signatureLength = 2 + rLength + sLength;
+        return true;
+    }
+
+    bool generateKeyP256(uint8_t *publicKey, size_t capacity,
+                         size_t &publicKeyLength) override {
+        publicKeyLength = 0;
+        if (publicKey == nullptr || capacity < 65) {
+            return false;
+        }
+        if (pendingKeyId_ != PSA_KEY_ID_NULL) {
+            psa_destroy_key(pendingKeyId_);
+            pendingKeyId_ = PSA_KEY_ID_NULL;
+        }
+
+        psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+        psa_set_key_type(
+            &attributes,
+            PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+        psa_set_key_bits(&attributes, 256);
+        psa_set_key_usage_flags(
+            &attributes, PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_EXPORT);
+        psa_set_key_algorithm(&attributes, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+        const psa_status_t generateStatus =
+            psa_generate_key(&attributes, &pendingKeyId_);
+        psa_reset_key_attributes(&attributes);
+        if (generateStatus != PSA_SUCCESS) {
+            pendingKeyId_ = PSA_KEY_ID_NULL;
+            return false;
+        }
+
+        size_t exportedLength = 0;
+        if (psa_export_public_key(pendingKeyId_, publicKey, capacity,
+                                  &exportedLength) != PSA_SUCCESS ||
+            exportedLength != 65) {
+            psa_destroy_key(pendingKeyId_);
+            pendingKeyId_ = PSA_KEY_ID_NULL;
+            return false;
+        }
+        publicKeyLength = exportedLength;
+        return true;
+    }
+
+    // A generated key stays volatile until the matching certificate arrives.
+    // Persisting it earlier would leave a key that no stored certificate
+    // matches, and initialize() refuses to boot that pair.
+    bool storeCertificate(deskid::Bytes certificateDer) override {
+        if (certificateDer.data == nullptr || certificateDer.size == 0 ||
+            certificateDer.size > certificate_.size()) {
+            return false;
+        }
+        uint8_t certificatePublicKey[65];
+        if (!extractCertificatePublicKey(certificateDer,
+                                         certificatePublicKey)) {
+            return false;
+        }
+        const bool adoptsPendingKey =
+            publicKeyMatches(pendingKeyId_, certificatePublicKey);
+        if (!adoptsPendingKey &&
+            !publicKeyMatches(keyId_, certificatePublicKey)) {
+            return false;
+        }
+
+        uint8_t scalar[32]{};
+        size_t scalarLength = 0;
+        if (adoptsPendingKey &&
+            (psa_export_key(pendingKeyId_, scalar, sizeof(scalar),
+                            &scalarLength) != PSA_SUCCESS ||
+             scalarLength != sizeof(scalar))) {
+            secureZero(scalar, sizeof(scalar));
+            return false;
+        }
+
+        nvs_handle_t handle;
+        esp_err_t result = nvs_open(kStorageNamespace, NVS_READWRITE, &handle);
+        if (result == ESP_OK) {
+            result = nvs_set_blob(handle, kCertificateKey, certificateDer.data,
+                                  certificateDer.size);
+            if (result == ESP_OK && adoptsPendingKey) {
+                result =
+                    nvs_set_blob(handle, kPrivateKeyKey, scalar, scalarLength);
+            }
+            if (result == ESP_OK) {
+                result = nvs_commit(handle);
+            }
+            nvs_close(handle);
+        }
+        secureZero(scalar, sizeof(scalar));
+        if (result != ESP_OK) {
+            return false;
+        }
+
+        if (adoptsPendingKey) {
+            if (keyId_ != PSA_KEY_ID_NULL) {
+                psa_destroy_key(keyId_);
+            }
+            keyId_ = pendingKeyId_;
+            pendingKeyId_ = PSA_KEY_ID_NULL;
+        }
+        std::memcpy(certificate_.data(), certificateDer.data,
+                    certificateDer.size);
+        certificateLength_ = certificateDer.size;
+        return refreshIdentifier() == ESP_OK;
+    }
+
+    uint32_t sensorPassword() const { return sensorPassword_; }
+    bool sensorProvisioned() const { return sensorProvisioned_; }
+
+    esp_err_t markSensorProvisioned() {
+        if (sensorProvisioned_) {
+            return ESP_OK;
+        }
+        nvs_handle_t handle;
+        ESP_RETURN_ON_ERROR(
+            nvs_open(kStorageNamespace, NVS_READWRITE, &handle), "IDENTITY",
+            "Unable to open credential state");
+        esp_err_t result = nvs_set_u8(handle, kSensorReadyKey, 1);
+        if (result == ESP_OK) {
+            result = nvs_commit(handle);
+        }
+        nvs_close(handle);
+        if (result == ESP_OK) {
+            sensorProvisioned_ = true;
+        }
+        return result;
+    }
+
+private:
+    // A unit is manufactured by flashing firmware alone, so the sensor password
+    // is created here on first boot and never leaves the board. Erasing NVS
+    // therefore strands the sensor at the password it was already given.
+    esp_err_t loadSensorPassword(nvs_handle_t handle) {
+        esp_err_t result =
+            nvs_get_u32(handle, kSensorPasswordKey, &sensorPassword_);
+        if (result == ESP_ERR_NVS_NOT_FOUND ||
+            (result == ESP_OK && sensorPassword_ == 0)) {
+            while (sensorPassword_ == 0) {
+                esp_fill_random(&sensorPassword_, sizeof(sensorPassword_));
+            }
+            result = nvs_set_u32(handle, kSensorPasswordKey, sensorPassword_);
+            if (result == ESP_OK) {
+                result = nvs_commit(handle);
+            }
+        }
+        ESP_RETURN_ON_ERROR(result, "IDENTITY",
+                            "Unable to establish the sensor password");
+
+        uint8_t ready = 0;
+        result = nvs_get_u8(handle, kSensorReadyKey, &ready);
+        sensorProvisioned_ = result == ESP_OK && ready == 1;
+        return result == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : result;
+    }
+
+    // A factory board carries no identity, and a corrupt one must not brick the
+    // unit: both still enumerate, so provisioning over USB can create a new
+    // identity and the status object reports which case it is.
+    void loadCredential(nvs_handle_t handle) {
+        size_t certificateLength = certificate_.size();
+        if (nvs_get_blob(handle, kCertificateKey, certificate_.data(),
+                         &certificateLength) != ESP_OK ||
+            certificateLength == 0) {
+            return;
+        }
+
+        uint8_t scalar[32];
+        size_t keyLength = privateKeyDer_.size();
+        const bool loaded =
+            nvs_get_blob(handle, kPrivateKeyKey, privateKeyDer_.data(),
+                         &keyLength) == ESP_OK &&
+            keyLength != 0 &&
+            extractPrivateScalar({privateKeyDer_.data(), keyLength}, scalar);
+        secureZero(privateKeyDer_.data(), privateKeyDer_.size());
+        if (!loaded) {
+            secureZero(scalar, sizeof(scalar));
+            return;
+        }
+
+        psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+        psa_set_key_type(
+            &attributes,
+            PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+        psa_set_key_bits(&attributes, 256);
+        psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH);
+        psa_set_key_algorithm(&attributes,
+                              PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+        const psa_status_t importStatus =
+            psa_import_key(&attributes, scalar, sizeof(scalar), &keyId_);
+        psa_reset_key_attributes(&attributes);
+        secureZero(scalar, sizeof(scalar));
+        if (importStatus != PSA_SUCCESS) {
+            keyId_ = PSA_KEY_ID_NULL;
+            return;
+        }
+
+        uint8_t certificatePublicKey[65];
+        certificateLength_ = certificateLength;
+        if (!extractCertificatePublicKey(
+                {certificate_.data(), certificateLength_},
+                certificatePublicKey) ||
+            !publicKeyMatches(keyId_, certificatePublicKey) ||
+            refreshIdentifier() != ESP_OK) {
+            psa_destroy_key(keyId_);
+            keyId_ = PSA_KEY_ID_NULL;
+            certificateLength_ = 0;
+        }
+    }
+
+    bool publicKeyMatches(psa_key_id_t keyId,
+                          const uint8_t expected[65]) const {
+        if (keyId == PSA_KEY_ID_NULL) {
+            return false;
+        }
+        uint8_t exported[65];
+        size_t exportedLength = 0;
+        return psa_export_public_key(keyId, exported, sizeof(exported),
+                                     &exportedLength) == PSA_SUCCESS &&
+               exportedLength == sizeof(exported) &&
+               std::memcmp(expected, exported, sizeof(exported)) == 0;
+    }
+
+    esp_err_t refreshIdentifier() {
+        uint8_t certificateHash[32];
+        size_t hashLength = 0;
+        if (psa_hash_compute(PSA_ALG_SHA_256, certificate_.data(),
+                             certificateLength_, certificateHash,
+                             sizeof(certificateHash),
+                             &hashLength) != PSA_SUCCESS ||
+            hashLength != sizeof(certificateHash)) {
+            secureZero(certificateHash, sizeof(certificateHash));
+            return ESP_FAIL;
+        }
+        std::memcpy(identifier_.data(), certificateHash, identifier_.size());
+        secureZero(certificateHash, sizeof(certificateHash));
+        return ESP_OK;
+    }
+
+    std::array<uint8_t, 1800> certificate_{};
+    std::array<uint8_t, 512> privateKeyDer_{};
+    std::array<uint8_t, 16> identifier_{};
+    size_t certificateLength_ = 0;
+    psa_key_id_t keyId_ = PSA_KEY_ID_NULL;
+    psa_key_id_t pendingKeyId_ = PSA_KEY_ID_NULL;
+    uint32_t sensorPassword_ = 0;
+    bool sensorProvisioned_ = false;
+};
+
+class R503Sensor {
+public:
+    enum class MatchResult {
+        noFinger,
+        matched,
+        notMatched,
+        sensorError,
+    };
+
+    esp_err_t initialize(uint32_t password, bool allowInitialPasswordChange) {
+        uart_config_t uartConfiguration{};
+        uartConfiguration.baud_rate = kFingerprintBaudRate;
+        uartConfiguration.data_bits = UART_DATA_8_BITS;
+        uartConfiguration.parity = UART_PARITY_DISABLE;
+        uartConfiguration.stop_bits = UART_STOP_BITS_1;
+        uartConfiguration.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+        uartConfiguration.source_clk = UART_SCLK_DEFAULT;
+        ESP_RETURN_ON_ERROR(uart_param_config(kFingerprintUart,
+                                              &uartConfiguration),
+                            "R503", "Unable to configure UART");
+        ESP_RETURN_ON_ERROR(
+            uart_driver_install(kFingerprintUart, 512, 0, 0, nullptr, 0),
+            "R503", "Unable to install UART driver");
+
+        gpio_config_t wakeConfiguration{};
+        wakeConfiguration.pin_bit_mask = 1ULL << kFingerprintWakePin;
+        wakeConfiguration.mode = GPIO_MODE_INPUT;
+        wakeConfiguration.pull_down_en = GPIO_PULLDOWN_ENABLE;
+        wakeConfiguration.pull_up_en = GPIO_PULLUP_DISABLE;
+        wakeConfiguration.intr_type = GPIO_INTR_DISABLE;
+        ESP_RETURN_ON_ERROR(gpio_config(&wakeConfiguration), "R503",
+                            "Unable to configure wake pin");
+
+        // The Super Mini's front silkscreen misprints RX next to both UART
+        // pads, so a miswired pair is easy and silent. Probe the documented
+        // orientation first, then the swap, and keep the one the sensor
+        // answers on. Weak drive limits the contention current while the
+        // wrong orientation has our transmitter facing the sensor's.
+        gpio_set_drive_capability(kFingerprintTransmitPin, GPIO_DRIVE_CAP_0);
+        gpio_set_drive_capability(kFingerprintReceivePin, GPIO_DRIVE_CAP_0);
+        for (const bool swapped : {false, true}) {
+            const gpio_num_t transmitPin =
+                swapped ? kFingerprintReceivePin : kFingerprintTransmitPin;
+            const gpio_num_t receivePin =
+                swapped ? kFingerprintTransmitPin : kFingerprintReceivePin;
+            ESP_RETURN_ON_ERROR(
+                uart_set_pin(kFingerprintUart, transmitPin, receivePin,
+                             UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE),
+                "R503", "Unable to assign UART pins");
+            vTaskDelay(pdMS_TO_TICKS(200));
+            uart_flush_input(kFingerprintUart);
+            if (!authenticate(password, allowInitialPasswordChange)) {
+                continue;
+            }
+            if (!enforceSecurityLevel(password, kFingerprintSecurityLevel)) {
+                return ESP_ERR_INVALID_STATE;
+            }
+            refreshTemplateCount();
+            password_ = password;
+            setLed(0x04, 0x02, 0);
+            return ESP_OK;
+        }
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    bool wakeLineHigh() const {
+        return gpio_get_level(kFingerprintWakePin) == 1;
+    }
+
+    // The wake line is believed only after it has been seen at both levels.
+    // A wire that was never connected reads low forever; one bridged to a rail
+    // reads high forever. Both look like a confident answer and neither is
+    // one, and acting on either costs an image capture every poll. Measured on
+    // this bench: unwired read `floating`, and a repaired joint read
+    // `driven high` in every state including firm ring contact.
+    void observeWakeLine() {
+        wakeLineSeen_ |= wakeLineHigh() ? 0b10 : 0b01;
+    }
+
+    bool wakeLineUsable() const { return wakeLineSeen_ == 0b11; }
+
+    // What GPIO4 does under each internal bias, as `pullUp << 1 | pullDown`.
+    // A pin nothing is driving follows the bias and reads 0b10; a pin being
+    // driven reads the same both ways. So:
+    //
+    //   0b10  floating  — the blue wire is not connected, or the R503's
+    //                     WAKEUP is open-drain and idle
+    //   0b11  driven high
+    //   0b00  driven low
+    //
+    // Sample it untouched and again with a finger on the ring and the wiring
+    // question answers itself, including which polarity this R503 uses. The
+    // R503 is sold with both an active-high push-pull WAKEUP and an
+    // open-drain one, and a board wired for the wrong one reads low forever
+    // and looks exactly like a board with no wire at all.
+    uint8_t wakeLineBias() const {
+        gpio_set_pull_mode(kFingerprintWakePin, GPIO_PULLUP_ONLY);
+        vTaskDelay(pdMS_TO_TICKS(2));
+        const int pulledUp = gpio_get_level(kFingerprintWakePin);
+        gpio_set_pull_mode(kFingerprintWakePin, GPIO_PULLDOWN_ONLY);
+        vTaskDelay(pdMS_TO_TICKS(2));
+        const int pulledDown = gpio_get_level(kFingerprintWakePin);
+        return static_cast<uint8_t>(pulledUp << 1 | pulledDown);
+    }
+
+    // A brownout, a nudged wire or a glitch on the 3V3 rail restarts the R503
+    // mid-session, and every command after that fails because the password has
+    // to be presented again. Nothing recovered from that: the ring stayed lit
+    // on whatever LED command last got through and the board needed unplugging.
+    // Re-authenticating costs one UART round trip every two seconds while the
+    // sensor is unhappy, and nothing at all when it is not.
+    bool recover() {
+        if (state_ != 2 || password_ == 0) {
+            return state_ == 1;
+        }
+        uart_flush_input(kFingerprintUart);
+        if (!verifyPassword(password_)) {
+            return false;
+        }
+        refreshTemplateCount();
+        turnLedOff();
+        return true;
+    }
+
+    // WAKEUP is a shortcut, not a requirement: GenImg answers 0x02 when the
+    // ring is untouched, so an unwired or broken wake line costs a UART round
+    // trip rather than the sensor.
+    bool fingerPresent() {
+        if (wakeLineHigh()) {
+            return true;
+        }
+        uint8_t confirmation = 0xFF;
+        size_t responseLength = 0;
+        return command(0x01, nullptr, 0, confirmation, nullptr, 0,
+                       responseLength) &&
+               confirmation == 0x00;
+    }
+
+    bool authenticate(uint32_t password, bool allowInitialPasswordChange) {
+        return verifyPassword(password) ||
+               (allowInitialPasswordChange && password != 0 &&
+                verifyPassword(0) && changePassword(password) &&
+                verifyPassword(password));
+    }
+
+    MatchResult captureAndMatch(uint16_t &fingerId, uint16_t &confidence) {
+        fingerId = 0;
+        confidence = 0;
+
+        uint8_t confirmation = 0xFF;
+        size_t responseLength = 0;
+        if (!command(0x01, nullptr, 0, confirmation, nullptr, 0,
+                     responseLength)) {
+            return MatchResult::sensorError;
+        }
+        if (confirmation == 0x02) {
+            return MatchResult::noFinger;
+        }
+        if (confirmation != 0x00) {
+            return MatchResult::sensorError;
+        }
+
+        constexpr uint8_t imageBuffer[] = {0x01};
+        if (!command(0x02, imageBuffer, sizeof(imageBuffer), confirmation,
+                     nullptr, 0, responseLength) || confirmation != 0x00) {
+            return MatchResult::sensorError;
+        }
+
+        const uint8_t searchParameters[] = {
+            0x01,
+            0x00,
+            0x00,
+            static_cast<uint8_t>(kFingerprintCapacity >> 8),
+            static_cast<uint8_t>(kFingerprintCapacity),
+        };
+        uint8_t response[4];
+        if (!command(0x04, searchParameters, sizeof(searchParameters),
+                     confirmation, response, sizeof(response),
+                     responseLength)) {
+            return MatchResult::sensorError;
+        }
+        if (confirmation == 0x09) {
+            return MatchResult::notMatched;
+        }
+        if (confirmation != 0x00 || responseLength != sizeof(response)) {
+            return MatchResult::sensorError;
+        }
+        fingerId = static_cast<uint16_t>(response[0] << 8 | response[1]);
+        confidence = static_cast<uint16_t>(response[2] << 8 | response[3]);
+        return MatchResult::matched;
+    }
+
+    // R503 Empty (0x0D). The only way back from a template the sensor no
+    // longer recognises, since a bad enrollment cannot be selectively deleted
+    // without knowing which slot went wrong.
+    bool empty() {
+        uint8_t confirmation = 0xFF;
+        size_t responseLength = 0;
+        if (!command(0x0D, nullptr, 0, confirmation, nullptr, 0,
+                     responseLength) ||
+            confirmation != 0x00) {
+            return false;
+        }
+        templateCount_ = 0;
+        enrollStage_ = 0;
+        return true;
+    }
+
+    uint8_t enrollStep() {
+        if (enrollStage_ == 0) {
+            const uint8_t confirmation = captureInto(0x01);
+            if (confirmation == 0x02) {
+                return 0;
+            }
+            if (confirmation != 0x00) {
+                return abortEnrollment();
+            }
+            enrollStage_ = 1;
+            showSuccess();
+            return 1;
+        }
+        if (enrollStage_ == 1) {
+            if (fingerPresent()) {
+                return 1;
+            }
+            enrollStage_ = 2;
+            showWaiting();
+            return 2;
+        }
+        uint8_t confirmation = captureInto(0x02);
+        if (confirmation == 0x02) {
+            return 2;
+        }
+        // DeskID never deletes a template, so the library has no gaps and the
+        // count is also the next free page.
+        const uint8_t store[] = {
+            0x01,
+            static_cast<uint8_t>(templateCount_ >> 8),
+            static_cast<uint8_t>(templateCount_),
+        };
+        size_t responseLength = 0;
+        if (confirmation != 0x00 ||
+            !command(0x05, nullptr, 0, confirmation, nullptr, 0,
+                     responseLength) ||
+            confirmation != 0x00 ||
+            !command(0x06, store, sizeof(store), confirmation, nullptr, 0,
+                     responseLength) ||
+            confirmation != 0x00) {
+            return abortEnrollment();
+        }
+        enrollStage_ = 0;
+        refreshTemplateCount();
+        showSuccess();
+        return 3;
+    }
+
+    void showWaiting() { setLed(0x01, 0x02, 0); }
+    // The ring answers contact, not the match that follows it. Reading an
+    // image takes a few hundred milliseconds and a dark sensor during them
+    // reads as a sensor that missed the finger, so the light goes solid the
+    // moment skin lands and simply stays solid if the match succeeds.
+    void showTouched() { setLed(0x03, 0x02, 0); }
+    void showSuccess() { setLed(0x03, 0x02, 0); }
+    void showFailure() { setLed(0x02, 0x01, 2); }
+    void turnLedOff() { setLed(0x04, 0x02, 0); }
+
+    uint8_t state() const { return state_; }
+    uint8_t lastConfirmation() const { return lastConfirmation_; }
+    uint16_t templateCount() const { return templateCount_; }
+
+    // The R503 stores the level itself, so a reboot puts the compiled default
+    // back: this is a live measurement aid, not a setting.
+    bool enforceSecurityLevel(uint32_t password, uint8_t requiredLevel) {
+        uint8_t confirmation = 0xFF;
+        uint8_t parameters[16];
+        size_t responseLength = 0;
+        if (!command(0x0F, nullptr, 0, confirmation, parameters,
+                     sizeof(parameters), responseLength) ||
+            confirmation != 0x00 || responseLength != sizeof(parameters)) {
+            return false;
+        }
+        const uint16_t currentLevel =
+            static_cast<uint16_t>(parameters[6] << 8 | parameters[7]);
+        if (currentLevel == requiredLevel) {
+            return true;
+        }
+        const uint8_t setting[] = {0x05, requiredLevel};
+        if (!command(0x0E, setting, sizeof(setting), confirmation, nullptr, 0,
+                     responseLength) ||
+            confirmation != 0x00 ||
+            !command(0x3D, nullptr, 0, confirmation, nullptr, 0,
+                     responseLength) ||
+            confirmation != 0x00) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+        if (!verifyPassword(password) ||
+            !command(0x0F, nullptr, 0, confirmation, parameters,
+                     sizeof(parameters), responseLength) ||
+            confirmation != 0x00 || responseLength != sizeof(parameters)) {
+            return false;
+        }
+        return static_cast<uint16_t>(parameters[6] << 8 | parameters[7]) ==
+               requiredLevel;
+    }
+
+private:
+    bool passwordCommand(uint8_t instruction, uint32_t password) {
+        uint8_t parameters[] = {
+            static_cast<uint8_t>(password >> 24),
+            static_cast<uint8_t>(password >> 16),
+            static_cast<uint8_t>(password >> 8),
+            static_cast<uint8_t>(password),
+        };
+        uint8_t confirmation = 0xFF;
+        size_t responseLength = 0;
+        const bool succeeded =
+            command(instruction, parameters, sizeof(parameters), confirmation,
+                    nullptr, 0, responseLength) &&
+            confirmation == 0x00;
+        secureZero(parameters, sizeof(parameters));
+        return succeeded;
+    }
+
+    bool verifyPassword(uint32_t password) {
+        return passwordCommand(0x13, password);
+    }
+
+    bool changePassword(uint32_t password) {
+        return passwordCommand(0x12, password);
+    }
+
+    bool readExact(uint8_t *destination, size_t length,
+                   uint32_t timeoutMilliseconds) {
+        const int64_t deadline = esp_timer_get_time() +
+                                 timeoutMilliseconds * 1000LL;
+        size_t offset = 0;
+        while (offset < length) {
+            const int64_t remainingMicroseconds =
+                deadline - esp_timer_get_time();
+            if (remainingMicroseconds <= 0) {
+                return false;
+            }
+            const TickType_t timeout = std::max<TickType_t>(
+                1, pdMS_TO_TICKS((remainingMicroseconds + 999) / 1000));
+            const int received = uart_read_bytes(
+                kFingerprintUart, destination + offset, length - offset,
+                timeout);
+            if (received <= 0) {
+                return false;
+            }
+            offset += static_cast<size_t>(received);
+        }
+        return true;
+    }
+
+    bool command(uint8_t instruction, const uint8_t *parameters,
+                 size_t parameterLength, uint8_t &confirmation,
+                 uint8_t *response, size_t responseCapacity,
+                 size_t &responseLength) {
+        responseLength = 0;
+        if (parameterLength > 32 ||
+            (parameterLength != 0 && parameters == nullptr)) {
+            return false;
+        }
+        state_ = 2;
+
+        uint8_t packet[44];
+        const uint16_t packetLength =
+            static_cast<uint16_t>(parameterLength + 3);
+        constexpr uint8_t prefix[] = {0xEF, 0x01, 0xFF, 0xFF,
+                                      0xFF, 0xFF, 0x01};
+        std::memcpy(packet, prefix, sizeof(prefix));
+        packet[7] = static_cast<uint8_t>(packetLength >> 8);
+        packet[8] = static_cast<uint8_t>(packetLength);
+        packet[9] = instruction;
+        if (parameterLength != 0) {
+            std::memcpy(packet + 10, parameters, parameterLength);
+        }
+        uint16_t checksum = 0x01 + packet[7] + packet[8] + instruction;
+        for (size_t index = 0; index < parameterLength; ++index) {
+            checksum += parameters[index];
+        }
+        packet[10 + parameterLength] = static_cast<uint8_t>(checksum >> 8);
+        packet[11 + parameterLength] = static_cast<uint8_t>(checksum);
+
+        uart_flush_input(kFingerprintUart);
+        const size_t totalLength = 12 + parameterLength;
+        const bool transmitted =
+            uart_write_bytes(kFingerprintUart, packet, totalLength) ==
+                static_cast<int>(totalLength) &&
+            uart_wait_tx_done(kFingerprintUart, pdMS_TO_TICKS(100)) == ESP_OK;
+        secureZero(packet, sizeof(packet));
+        if (!transmitted) {
+            return false;
+        }
+
+        uint8_t header[9];
+        if (!readExact(header, sizeof(header), 500) || header[0] != 0xEF ||
+            header[1] != 0x01 || header[2] != 0xFF || header[3] != 0xFF ||
+            header[4] != 0xFF || header[5] != 0xFF || header[6] != 0x07) {
+            return false;
+        }
+        const uint16_t acknowledgementLength =
+            static_cast<uint16_t>(header[7] << 8 | header[8]);
+        if (acknowledgementLength < 3 || acknowledgementLength > 35) {
+            return false;
+        }
+        uint8_t payload[35];
+        if (!readExact(payload, acknowledgementLength, 500)) {
+            return false;
+        }
+
+        uint16_t expectedChecksum = 0x07 + header[7] + header[8];
+        for (size_t index = 0; index < acknowledgementLength - 2; ++index) {
+            expectedChecksum += payload[index];
+        }
+        const uint16_t receivedChecksum = static_cast<uint16_t>(
+            payload[acknowledgementLength - 2] << 8 |
+            payload[acknowledgementLength - 1]);
+        if (expectedChecksum != receivedChecksum) {
+            return false;
+        }
+
+        confirmation = payload[0];
+        if (confirmation != 0x00) {
+            lastConfirmation_ = confirmation;
+        }
+        state_ = 1;
+        responseLength = acknowledgementLength - 3;
+        if (responseLength > responseCapacity ||
+            (responseLength != 0 && response == nullptr)) {
+            return false;
+        }
+        if (responseLength != 0) {
+            std::memcpy(response, payload + 1, responseLength);
+        }
+        return true;
+    }
+
+    uint8_t captureInto(uint8_t buffer) {
+        uint8_t confirmation = 0xFF;
+        size_t responseLength = 0;
+        if (!command(0x01, nullptr, 0, confirmation, nullptr, 0,
+                     responseLength)) {
+            return 0xFF;
+        }
+        if (confirmation != 0x00) {
+            return confirmation;
+        }
+        const uint8_t parameters[] = {buffer};
+        if (!command(0x02, parameters, sizeof(parameters), confirmation,
+                     nullptr, 0, responseLength)) {
+            return 0xFF;
+        }
+        return confirmation;
+    }
+
+    uint8_t abortEnrollment() {
+        enrollStage_ = 0;
+        showFailure();
+        return 0xFF;
+    }
+
+    void refreshTemplateCount() {
+        uint8_t confirmation = 0xFF;
+        uint8_t response[2];
+        size_t responseLength = 0;
+        if (command(0x1D, nullptr, 0, confirmation, response,
+                    sizeof(response), responseLength) &&
+            confirmation == 0x00 && responseLength == sizeof(response)) {
+            templateCount_ =
+                static_cast<uint16_t>(response[0] << 8 | response[1]);
+        }
+    }
+
+    void setLed(uint8_t control, uint8_t color, uint8_t times) {
+        const uint8_t parameters[] = {control, 0x40, color, times};
+        uint8_t confirmation = 0xFF;
+        size_t responseLength = 0;
+        command(0x35, parameters, sizeof(parameters), confirmation, nullptr, 0,
+                responseLength);
+    }
+
+    uint8_t state_ = 0;
+    uint8_t wakeLineSeen_ = 0;
+    uint32_t password_ = 0;
+    uint8_t lastConfirmation_ = 0;
+    uint16_t templateCount_ = 0;
+    uint8_t enrollStage_ = 0;
+};
+
+// Finger-on to match-confirmed for the last successful authentication, the
+// number the product is judged by. Read back through status tag 0x0D.
+uint32_t g_lastMatchMilliseconds = 0;
+// Why the last presence gate ended, and which instruction asked for it.
+// Tags 0x0E / 0x0F in the status object. 1 matched, 2 timed out, 3 aborted
+// by the host, 4 card re-powered, 5 rate-limiter lockout, 6 sensor absent.
+uint8_t g_lastGateOutcome = 0;
+uint8_t g_lastGateInstruction = 0;
+// A match that happened before any host asked for one. Reported through status
+// tags 0x11 and 0x12; the policy it enforces is tested in test/test_piv.
+deskid::EarlyTouch g_earlyTouch(kEarlyTouchValidMilliseconds);
+
+// Owned by the idle scanner below, but also cleared by the gated path, which
+// drives the same ring and leaves the same finger resting on it.
+// Until when the host has asked the board to watch its own sensor.
+uint64_t g_ringArmedUntilMs = 0;
+
+bool ringArmed() { return millisecondsSinceBoot() < g_ringArmedUntilMs; }
+
+bool g_idleWaitForRemoval = false;
+bool g_idleRingLit = false;
+// When the finger currently on the ring first landed. A capture that comes
+// back "image too messy" is retried, and timing from the retry rather than
+// from contact would quietly flatter the one number the product is judged by.
+int64_t g_idleTouchStartedAtUs = 0;
+int g_idleRetriesThisTouch = 0;
+
+class BoardDiagnostics final : public deskid::DeviceDiagnostics {
+public:
+    BoardDiagnostics(const StoredPivCredential &credential, R503Sensor &sensor,
+                     const deskid::RateLimiter &limiter)
+        : credential_(credential), sensor_(sensor), limiter_(limiter) {}
+
+    deskid::DeviceStatus status() const override {
+        const uint64_t now = millisecondsSinceBoot();
+        deskid::DeviceStatus value;
+        value.firmwareVersion = kFirmwareVersion;
+        value.buildVariant = kBuildVariant;
+        value.uptimeSeconds = static_cast<uint32_t>(now / 1000);
+        value.resetReason = static_cast<uint8_t>(esp_reset_reason());
+        value.freeHeapBytes = esp_get_free_heap_size();
+        value.sensorState = sensor_.state();
+        value.lastSensorConfirmation = sensor_.lastConfirmation();
+        value.credentialPresent = credential_.certificateDer().size != 0;
+        value.consecutiveFailures = static_cast<uint8_t>(
+            std::min<uint32_t>(limiter_.consecutiveFailures(), 0xFF));
+        value.lockoutSecondsRemaining = static_cast<uint32_t>(
+            (limiter_.lockoutMillisecondsRemaining(now) + 999) / 1000);
+        value.enrolledTemplates = sensor_.templateCount();
+        value.wakeLineHigh = sensor_.wakeLineHigh();
+        value.lastMatchMilliseconds = g_lastMatchMilliseconds;
+        value.lastGateOutcome = g_lastGateOutcome;
+        value.lastGateInstruction = g_lastGateInstruction;
+        value.secureRequests = deskid::ccidSecureRequests();
+        value.earlyTouchGates = g_earlyTouch.gates();
+        value.wakeLineBias = sensor_.wakeLineBias();
+        value.ringArmedSecondsRemaining = static_cast<uint8_t>(
+            ringArmed() ? std::min<uint64_t>(
+                              255, (g_ringArmedUntilMs - now + 999) / 1000)
+                        : 0);
+        value.touchValidSecondsRemaining = static_cast<uint8_t>(
+            std::min<uint64_t>(
+                255, (g_earlyTouch.millisecondsRemaining(now) + 999) / 1000));
+        return value;
+    }
+
+    bool enrollStep(uint8_t &stage) override {
+#if defined(DESKID_BRINGUP_NO_SENSOR)
+        (void)stage;
+        return false;
+#else
+        stage = sensor_.enrollStep();
+        return true;
+#endif
+    }
+
+    bool armRing(uint8_t seconds) override {
+        const uint8_t capped = std::min(seconds, kMaximumArmSeconds);
+        g_ringArmedUntilMs =
+            millisecondsSinceBoot() + static_cast<uint64_t>(capped) * 1000;
+        return true;
+    }
+
+    bool forgetFingerprints() override {
+#if defined(DESKID_BRINGUP_NO_SENSOR)
+        return false;
+#else
+        return sensor_.empty();
+#endif
+    }
+
+    bool enterDownloadMode() override {
+#if defined(DESKID_ALLOW_DOWNLOAD_MODE)
+        downloadModePending_ = true;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    void rebootIfRequested() {
+#if defined(DESKID_ALLOW_DOWNLOAD_MODE)
+        if (!downloadModePending_) {
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+        REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+        esp_restart();
+#endif
+    }
+
+private:
+    const StoredPivCredential &credential_;
+    R503Sensor &sensor_;
+    const deskid::RateLimiter &limiter_;
+    bool downloadModePending_ = false;
+};
+
+uint32_t savedFailureCount = 0;
+uint32_t savedLockoutCount = 0;
+
+// The lockout has to outlive a power cycle, or unplugging the device would be
+// the cheapest way to clear a run of failed matches.
+void loadLimiterState(deskid::RateLimiter &limiter) {
+    nvs_handle_t handle;
+    if (nvs_open(kStorageNamespace, NVS_READONLY, &handle) != ESP_OK) {
+        return;
+    }
+    nvs_get_u32(handle, kFailureCountKey, &savedFailureCount);
+    nvs_get_u32(handle, kLockoutCountKey, &savedLockoutCount);
+    nvs_close(handle);
+    limiter.restore(savedFailureCount, savedLockoutCount,
+                    millisecondsSinceBoot());
+}
+
+void saveLimiterState(const deskid::RateLimiter &limiter) {
+    if (limiter.consecutiveFailures() == savedFailureCount &&
+        limiter.lockoutCount() == savedLockoutCount) {
+        return;
+    }
+    nvs_handle_t handle;
+    if (nvs_open(kStorageNamespace, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    if (nvs_set_u32(handle, kFailureCountKey,
+                    limiter.consecutiveFailures()) == ESP_OK &&
+        nvs_set_u32(handle, kLockoutCountKey, limiter.lockoutCount()) ==
+            ESP_OK &&
+        nvs_commit(handle) == ESP_OK) {
+        savedFailureCount = limiter.consecutiveFailures();
+        savedLockoutCount = limiter.lockoutCount();
+    }
+    nvs_close(handle);
+}
+
+// One poll of the idle ring. The sensor is live between host requests, not
+// only while one is waiting, so a finger that lands on arrival is matched
+// there and then and the result held for kEarlyTouchValidMilliseconds. That
+// is what removes the dead time the product is actually judged by: macOS
+// draws its own PIN field before it ever reaches the card, and without this
+// the sensor stays dark until those digits have been typed.
+//
+// At most one capture per call, so a request arriving mid-match waits for one
+// match and not for a loop.
+void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter) {
+#if defined(DESKID_BRINGUP_NO_SENSOR)
+    // No sensor, so no touch to be early with; the gate approves everything
+    // anyway and pretending otherwise would hide that in the status object.
+    (void)sensor;
+    (void)limiter;
+#else
+    // sensorState 1 is "the R503 answered". An unwired or dead sensor must
+    // not turn this into a UART probe every 40 ms forever.
+    if (sensor.state() != 1 || sensor.templateCount() == 0 ||
+        limiter.locked(millisecondsSinceBoot())) {
+        return;
+    }
+
+    // Two ways to know a finger is there, and the cheap one is only used when
+    // the hardware has proved it works: see observeWakeLine(). Otherwise the
+    // host has to say when it is worth spending an image capture on.
+    const bool present = sensor.wakeLineUsable() ? sensor.wakeLineHigh()
+                                                 : sensor.fingerPresent();
+    if (!present) {
+        g_idleWaitForRemoval = false;
+        g_idleTouchStartedAtUs = 0;
+        g_idleRetriesThisTouch = 0;
+        if (g_idleRingLit) {
+            sensor.turnLedOff();
+            g_idleRingLit = false;
+        }
+        return;
+    }
+    // One rejected match per touch, so a wallet resting on the ring costs the
+    // rate limiter one attempt rather than a lockout. Holding a match already
+    // means there is nothing to gain from another.
+    if (g_idleWaitForRemoval ||
+        g_earlyTouch.held(millisecondsSinceBoot())) {
+        return;
+    }
+
+    if (g_idleTouchStartedAtUs == 0) {
+        g_idleTouchStartedAtUs = esp_timer_get_time();
+    }
+    if (!g_idleRingLit) {
+        sensor.showTouched();
+        g_idleRingLit = true;
+    }
+    uint16_t fingerId = 0;
+    uint16_t confidence = 0;
+    switch (sensor.captureAndMatch(fingerId, confidence)) {
+        case R503Sensor::MatchResult::matched:
+            g_lastMatchMilliseconds = static_cast<uint32_t>(
+                (esp_timer_get_time() - g_idleTouchStartedAtUs) / 1000);
+            g_idleRetriesThisTouch = 0;
+            limiter.recordSuccess();
+            g_earlyTouch.record(millisecondsSinceBoot());
+            sensor.showSuccess();
+            vTaskDelay(pdMS_TO_TICKS(250));
+            sensor.turnLedOff();
+            g_idleRingLit = false;
+            g_idleWaitForRemoval = true;
+            saveLimiterState(limiter);
+            return;
+        case R503Sensor::MatchResult::notMatched:
+            limiter.recordFailure(millisecondsSinceBoot());
+            saveLimiterState(limiter);
+            if (!limiter.locked(millisecondsSinceBoot()) &&
+                ++g_idleRetriesThisTouch < kRetriesPerTouch) {
+                return;  // still the same finger; try the next image
+            }
+            sensor.showFailure();
+            sensor.turnLedOff();
+            g_idleRingLit = false;
+            g_idleWaitForRemoval = true;
+            return;
+        case R503Sensor::MatchResult::sensorError:
+        case R503Sensor::MatchResult::noFinger:
+            // Half a finger, or it lifted between the wake line and the
+            // capture. Nothing was rejected, so nothing is spent and the ring
+            // stays lit while the next poll tries again — blinking it off and
+            // on per attempt would read as a sensor that keeps losing the
+            // finger.
+            if (++g_idleRetriesThisTouch >= kRetriesPerTouch * 2) {
+                sensor.turnLedOff();
+                g_idleRingLit = false;
+                g_idleWaitForRemoval = true;
+            }
+            return;
+    }
+#endif
+}
+
+bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
+                          const deskid::CcidRequest &request,
+                          uint32_t powerEpoch) {
+#if defined(DESKID_BRINGUP_NO_SENSOR)
+    // ponytail: bench bring-up with no R503 attached approves every request,
+    // so there is no user presence at all. Drop the flag once the sensor is
+    // wired to restore the real match gate.
+    (void)sensor;
+    (void)limiter;
+    (void)request;
+    (void)powerEpoch;
+    return true;
+#else
+    g_lastGateInstruction = request.apduLength > 1 ? request.apdu[1] : 0;
+    g_lastGateOutcome = 2;
+    // A touch that already happened answers the login instructions with no
+    // wait at all. It is spent here whether or not what follows succeeds, so
+    // one touch is one operation and it can never be replayed.
+    if (g_earlyTouch.spend(g_lastGateInstruction, millisecondsSinceBoot())) {
+        g_lastGateOutcome = 7;
+        return true;
+    }
+    if (limiter.locked(millisecondsSinceBoot())) {
+        g_lastGateOutcome = 5;
+        return false;
+    }
+    // Anything the host asks for now supersedes the idle scan, which shares
+    // the ring and may have left a finger resting on it.
+    g_idleWaitForRemoval = false;
+    g_idleRingLit = false;
+    sensor.showWaiting();
+    const int64_t deadline = esp_timer_get_time() +
+                             kAuthenticationTimeoutMilliseconds * 1000LL;
+    int64_t nextTimeExtension = esp_timer_get_time();
+    int64_t fingerSeenAt = 0;
+    bool waitForFingerRemoval = false;
+    int retriesThisTouch = 0;
+
+    while (esp_timer_get_time() < deadline) {
+        if (deskid::ccidRequestWasAborted(request) ||
+            deskid::ccidPowerEpoch() != powerEpoch) {
+            g_lastGateOutcome = deskid::ccidRequestWasAborted(request) ? 3 : 4;
+            sensor.turnLedOff();
+            g_idleWaitForRemoval = true;
+            return false;
+        }
+        const int64_t now = esp_timer_get_time();
+        if (now >= nextTimeExtension) {
+            deskid::sendCcidTimeExtension(request);
+            nextTimeExtension = now + 750000;
+        }
+
+        if (!sensor.fingerPresent()) {
+            fingerSeenAt = 0;
+            retriesThisTouch = 0;
+            if (waitForFingerRemoval) {
+                waitForFingerRemoval = false;
+                sensor.showWaiting();
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if (fingerSeenAt == 0) {
+            fingerSeenAt = esp_timer_get_time();
+            // Contact is answered before the match it starts. A capture takes
+            // a few hundred milliseconds and a ring that keeps breathing
+            // through them reads as one that missed the finger.
+            sensor.showTouched();
+        }
+        if (waitForFingerRemoval) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        deskid::sendCcidTimeExtension(request);
+        uint16_t fingerId = 0;
+        uint16_t confidence = 0;
+        switch (sensor.captureAndMatch(fingerId, confidence)) {
+            case R503Sensor::MatchResult::matched:
+                g_lastMatchMilliseconds = static_cast<uint32_t>(
+                    (esp_timer_get_time() - fingerSeenAt) / 1000);
+                g_lastGateOutcome = 1;
+                limiter.recordSuccess();
+                sensor.showSuccess();
+                vTaskDelay(pdMS_TO_TICKS(250));
+                sensor.turnLedOff();
+                g_idleWaitForRemoval = true;
+                return true;
+            case R503Sensor::MatchResult::notMatched:
+                limiter.recordFailure(millisecondsSinceBoot());
+                if (limiter.locked(millisecondsSinceBoot())) {
+                    sensor.showFailure();
+                    sensor.turnLedOff();
+                    g_idleWaitForRemoval = true;
+                    return false;
+                }
+                if (++retriesThisTouch < kRetriesPerTouch) {
+                    vTaskDelay(pdMS_TO_TICKS(120));
+                    break;
+                }
+                sensor.showFailure();
+                waitForFingerRemoval = true;
+                break;
+            case R503Sensor::MatchResult::sensorError:
+                // Usually "image too messy" from Img2Tz: the finger moved or
+                // only half landed. Try again while it is still there.
+                if (++retriesThisTouch < kRetriesPerTouch * 2) {
+                    vTaskDelay(pdMS_TO_TICKS(80));
+                    break;
+                }
+                sensor.showFailure();
+                waitForFingerRemoval = true;
+                break;
+            case R503Sensor::MatchResult::noFinger:
+                break;
+        }
+    }
+    sensor.turnLedOff();
+    g_idleWaitForRemoval = true;
+    return false;
+#endif
+}
+
+}  // namespace
+
+extern "C" void app_main() {
+#if defined(DESKID_PRODUCTION)
+    ESP_ERROR_CHECK(esp_efuse_is_flash_encryption_enabled()
+                        ? ESP_OK
+                        : ESP_ERR_INVALID_STATE);
+    ESP_ERROR_CHECK(esp_secure_boot_enabled() ? ESP_OK
+                                              : ESP_ERR_INVALID_STATE);
+#endif
+    ESP_ERROR_CHECK(nvs_flash_init());
+
+    static StoredPivCredential credential;
+    ESP_ERROR_CHECK(credential.initialize());
+
+    static R503Sensor sensor;
+#if !defined(DESKID_BRINGUP_NO_SENSOR)
+    // A miswired or dead sensor must not take USB down with it: without the
+    // CCID interface there is no status object and no way to find out why.
+    // Every match then fails closed, which is the safe direction.
+    if (sensor.initialize(credential.sensorPassword(),
+                          !credential.sensorProvisioned()) == ESP_OK) {
+        ESP_ERROR_CHECK(credential.markSensorProvisioned());
+    }
+#endif
+
+    static deskid::RateLimiter presenceLimiter(
+        kFingerprintFailureThreshold, kFingerprintBaseLockoutMilliseconds,
+        kFingerprintMaximumLockoutMilliseconds);
+    loadLimiterState(presenceLimiter);
+    static BoardDiagnostics diagnostics(credential, sensor, presenceLimiter);
+    static deskid::PivApplet applet(credential, diagnostics);
+    ESP_ERROR_CHECK(deskid::installCcidDevice());
+
+    static deskid::CcidRequest request;
+    static uint8_t response[deskid::CcidRequest::kMaximumApduLength];
+    uint32_t observedPowerEpoch = deskid::ccidPowerEpoch();
+    int64_t nextRecovery = 0;
+    int64_t nextArmedScan = 0;
+    while (true) {
+        if (!deskid::waitForCcidRequest(request, kIdleScanMilliseconds)) {
+            // Nothing from the host, so the ring belongs to the user.
+            const int64_t now = esp_timer_get_time();
+            if (sensor.state() == 2 && now >= nextRecovery) {
+                nextRecovery = now + 2000000;
+                sensor.recover();
+            }
+            sensor.observeWakeLine();
+            if (sensor.wakeLineUsable()) {
+                scanForEarlyTouch(sensor, presenceLimiter);
+            } else if (ringArmed() && now >= nextArmedScan) {
+                nextArmedScan =
+                    now + static_cast<int64_t>(kArmedScanMilliseconds) * 1000LL;
+                scanForEarlyTouch(sensor, presenceLimiter);
+            }
+            continue;
+        }
+
+        const uint32_t requestPowerEpoch = request.powerEpoch;
+        if (deskid::ccidPowerEpoch() != requestPowerEpoch) {
+            secureZero(request.apdu, request.apduLength);
+            request.apduLength = 0;
+            continue;
+        }
+        if (requestPowerEpoch != observedPowerEpoch) {
+            applet.reset();
+            observedPowerEpoch = requestPowerEpoch;
+        }
+
+        size_t responseLength = 0;
+        deskid::TransceiveStatus transceiveStatus = applet.transceive(
+            request.apdu, request.apduLength, false, response,
+            sizeof(response), responseLength);
+        if (transceiveStatus ==
+            deskid::TransceiveStatus::userPresenceRequired) {
+            if (authorizeFingerprint(sensor, presenceLimiter, request,
+                                     requestPowerEpoch)) {
+                transceiveStatus = applet.transceive(
+                    request.apdu, request.apduLength, true, response,
+                    sizeof(response), responseLength);
+            } else {
+                response[0] = 0x69;
+                response[1] = presenceLimiter.locked(millisecondsSinceBoot())
+                                  ? 0x83
+                                  : 0x82;
+                responseLength = 2;
+                transceiveStatus = deskid::TransceiveStatus::complete;
+            }
+            saveLimiterState(presenceLimiter);
+        }
+
+        if (transceiveStatus != deskid::TransceiveStatus::complete ||
+            deskid::ccidRequestWasAborted(request) ||
+            deskid::ccidPowerEpoch() != requestPowerEpoch) {
+            diagnostics.rebootIfRequested();
+            secureZero(request.apdu, request.apduLength);
+            request.apduLength = 0;
+            continue;
+        }
+        for (size_t attempt = 0; attempt < 4; ++attempt) {
+            if (deskid::sendCcidResponse(request, response,
+                                         responseLength)) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
+        diagnostics.rebootIfRequested();
+        secureZero(request.apdu, request.apduLength);
+        request.apduLength = 0;
+    }
+}
