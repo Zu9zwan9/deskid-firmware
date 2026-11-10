@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 560" width="980" height="560" font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif">
+  <rect width="980" height="560" fill="#f2f3f0"/>
+  <text x="40" y="46" font-size="22" font-weight="600" fill="#171a18">DeskID wiring — ESP32-S3 Super Mini to R503 fingerprint sensor</text>
+  <text x="40" y="70" font-size="13" fill="#666d68">Go by the printed labels, never by counting. Each edge starts with a pad outside the numbered row — 48 top left, BAT top right — and counting those shifts every wire by one.</text>
+
+  <!-- board -->
+  <rect x="70" y="110" width="210" height="330" rx="14" fill="#171a18"/>
+  <rect x="140" y="96" width="70" height="26" rx="6" fill="#c4cac4"/>
+  <text x="175" y="90" font-size="12" text-anchor="middle" fill="#666d68">USB-C to Mac</text>
+  <text x="175" y="418" font-size="13" text-anchor="middle" fill="#ffffff">Super Mini</text>
+  <text x="175" y="434" font-size="13" text-anchor="middle" fill="#ffffff">ESP32-S3</text>
+
+  <!-- r503 -->
+  <circle cx="820" cy="275" r="92" fill="#171a18"/>
+  <circle cx="820" cy="275" r="70" fill="#2b302c"/>
+  <circle cx="820" cy="275" r="52" fill="#0874d1" opacity="0.25"/>
+  <circle cx="820" cy="275" r="52" fill="none" stroke="#0874d1" stroke-width="4"/>
+  <text x="820" y="281" font-size="14" text-anchor="middle" fill="#ffffff">R503</text>
+  <text x="820" y="392" font-size="12" text-anchor="middle" fill="#666d68">3.3 V only — never 5 V</text>
+
+  <!-- pads + wires -->
+  <g font-size="13" stroke="#f2f3f0" stroke-width="4" paint-order="stroke fill">
+    <!-- VCC red -->
+    <circle cx="280" cy="150" r="7" fill="#d9ddd8" stroke="none"/>
+    <text x="268" y="146" text-anchor="end" fill="#ffffff" stroke="none">pad marked 3V3 · never 5V</text>
+    <path d="M280 150 C 430 150 560 165 728 232" fill="none" stroke="#bd3c34" stroke-width="5"/>
+    <text x="500" y="148" fill="#bd3c34">red — VCC</text>
+    <!-- 3.3VT white, same pad -->
+    <path d="M280 150 C 420 190 560 205 730 250" fill="none" stroke="#ffffff" stroke-width="5" stroke-dasharray="1"/>
+    <path d="M280 150 C 420 190 560 205 730 250" fill="none" stroke="#c4cac4" stroke-width="1"/>
+    <text x="500" y="190" fill="#666d68">white — 3.3VT (touch power)</text>
+
+    <!-- GND -->
+    <circle cx="280" cy="200" r="7" fill="#d9ddd8" stroke="none"/>
+    <text x="268" y="196" text-anchor="end" fill="#ffffff" stroke="none">pad marked GND</text>
+    <path d="M280 200 C 430 224 560 244 733 268" fill="none" stroke="#171a18" stroke-width="5"/>
+    <text x="500" y="226" fill="#171a18">black — GND</text>
+
+    <!-- TX pad GPIO43 -->
+    <circle cx="280" cy="250" r="7" fill="#d9ddd8" stroke="none"/>
+    <text x="268" y="246" text-anchor="end" fill="#ffffff" stroke="none">upper unlabelled pad · GPIO43</text>
+    <path d="M280 250 C 430 268 560 282 733 288" fill="none" stroke="#d8a800" stroke-width="5"/>
+    <text x="500" y="266" fill="#8a6d00">yellow — sensor TXD</text>
+
+    <!-- RX pad GPIO44 -->
+    <circle cx="280" cy="300" r="7" fill="#d9ddd8" stroke="none"/>
+    <text x="268" y="296" text-anchor="end" fill="#ffffff" stroke="none">lower unlabelled pad · GPIO44</text>
+    <path d="M280 300 C 430 318 560 322 730 308" fill="none" stroke="#2f7d32" stroke-width="5"/>
+    <text x="500" y="306" fill="#2f7d32">green — sensor RXD</text>
+
+    <!-- GP4 -->
+    <circle cx="280" cy="350" r="7" fill="#d9ddd8" stroke="none"/>
+    <text x="268" y="346" text-anchor="end" fill="#ffffff" stroke="none">pad marked 4 · GPIO4 · optional</text>
+    <path d="M280 350 C 430 372 560 366 726 326" fill="none" stroke="#0874d1" stroke-width="5"/>
+    <text x="500" y="372" fill="#0874d1">blue — WAKEUP, optional shortcut</text>
+  </g>
+
+  <!-- connector stub -->
+  <rect x="726" y="222" width="16" height="112" rx="4" fill="#c4cac4"/>
+
+  <g font-size="12" fill="#666d68">
+    <text x="40" y="492">If the pair ends up swapped the firmware retries once with the pins reversed, so boot costs a second instead of failing.</text>
+    <text x="40" y="472">Five wires are enough: GenImg reports an untouched ring, so the firmware probes over UART whenever the wake line reads low.</text>
+    <text x="40" y="512">Sensor draws roughly 20-60 mA at 3.3 V while scanning — power the board from USB, not a weak battery.</text>
+    <text x="40" y="532">Enroll through the board once wired: hw_smoke_test.py --enroll. DeskID rotates the factory password 00000000 on its first sensor boot.</text>
+  </g>
+</svg>
