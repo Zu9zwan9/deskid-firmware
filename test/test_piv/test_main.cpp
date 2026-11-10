@@ -1,0 +1,861 @@
+#include <unity.h>
+
+#include <array>
+#include <cstring>
+
+#include "deskid_core.h"
+
+namespace {
+
+class FakeCredential final : public deskid::PivCredential {
+public:
+    FakeCredential() { reset(); }
+
+    void reset() {
+        for (size_t index = 0; index < certificate_.size(); ++index) {
+            certificate_[index] = static_cast<uint8_t>(index);
+        }
+        certificateLength_ = certificate_.size();
+        generatedKeys = 0;
+    }
+
+    void forget() { certificateLength_ = 0; }
+
+    deskid::Bytes certificateDer() const override {
+        return {certificate_.data(), certificateLength_};
+    }
+
+    deskid::Bytes deviceIdentifier() const override {
+        if (certificateLength_ == 0) {
+            return {nullptr, 0};
+        }
+        return {identifier_.data(), identifier_.size()};
+    }
+
+    bool signP256Sha256(deskid::Bytes digest, uint8_t *signature,
+                        size_t capacity, size_t &signatureLength) override {
+        constexpr uint8_t value[] = {0x30, 0x06, 0x02, 0x01,
+                                     0x01, 0x02, 0x01, 0x02};
+        if (digest.size != 32 || capacity < sizeof(value)) {
+            return false;
+        }
+        std::memcpy(signature, value, sizeof(value));
+        signatureLength = sizeof(value);
+        return true;
+    }
+
+    bool generateKeyP256(uint8_t *publicKey, size_t capacity,
+                         size_t &publicKeyLength) override {
+        publicKeyLength = 0;
+        if (capacity < 65) {
+            return false;
+        }
+        publicKey[0] = 0x04;
+        for (size_t index = 1; index < 65; ++index) {
+            publicKey[index] = static_cast<uint8_t>(index);
+        }
+        publicKeyLength = 65;
+        ++generatedKeys;
+        return true;
+    }
+
+    bool storeCertificate(deskid::Bytes certificateDer) override {
+        if (certificateDer.size == 0 ||
+            certificateDer.size > certificate_.size()) {
+            return false;
+        }
+        std::memcpy(certificate_.data(), certificateDer.data,
+                    certificateDer.size);
+        certificateLength_ = certificateDer.size;
+        return true;
+    }
+
+    size_t generatedKeys = 0;
+
+private:
+    std::array<uint8_t, 300> certificate_{};
+    std::array<uint8_t, 16> identifier_{};
+    size_t certificateLength_ = 0;
+};
+
+class FakeDiagnostics final : public deskid::DeviceDiagnostics {
+public:
+    deskid::DeviceStatus status() const override {
+        deskid::DeviceStatus value;
+        value.firmwareVersion = "9.9.9";
+        value.buildVariant = 2;
+        value.uptimeSeconds = 0x00010203;
+        value.resetReason = 4;
+        value.freeHeapBytes = 0x0004ABCD;
+        value.sensorState = 1;
+        value.lastSensorConfirmation = 0x09;
+        value.credentialPresent = true;
+        value.consecutiveFailures = 3;
+        value.lockoutSecondsRemaining = 42;
+        value.enrolledTemplates = enrolledTemplates;
+        value.wakeLineHigh = true;
+        value.lastMatchMilliseconds = 1234;
+        value.earlyTouchGates = 7;
+        value.touchValidSecondsRemaining = 11;
+        value.wakeLineBias = 0b10;
+        value.ringArmedSecondsRemaining = 42;
+        return value;
+    }
+
+    bool enterDownloadMode() override {
+        ++downloadModeRequests;
+        return downloadModeSupported;
+    }
+
+    bool enrollStep(uint8_t &stage) override {
+        ++enrollRequests;
+        stage = enrollStage;
+        return enrollSupported;
+    }
+
+    bool armRing(uint8_t seconds) override {
+        armedSeconds = seconds;
+        return true;
+    }
+
+    bool forgetFingerprints() override {
+        ++forgetRequests;
+        if (forgetSupported) {
+            enrolledTemplates = 0;
+        }
+        return forgetSupported;
+    }
+
+    size_t downloadModeRequests = 0;
+    bool downloadModeSupported = true;
+    uint8_t armedSeconds = 0;
+    size_t enrollRequests = 0;
+    uint8_t enrollStage = 3;
+    bool enrollSupported = true;
+    size_t forgetRequests = 0;
+    bool forgetSupported = true;
+    uint32_t enrolledTemplates = 2;
+};
+
+FakeCredential credential;
+FakeDiagnostics diagnostics;
+deskid::PivApplet applet(credential, diagnostics);
+std::array<uint8_t, 512> response{};
+
+void selectApplet() {
+    constexpr uint8_t select[] = {0x00, 0xA4, 0x04, 0x00, 0x07, 0xF0, 0x44,
+                                  0x65, 0x73, 0x6B, 0x49, 0x44};
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(select, sizeof(select), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_HEX8(0x90, response[responseLength - 2]);
+    TEST_ASSERT_EQUAL_HEX8(0x00, response[responseLength - 1]);
+}
+
+}  // namespace
+
+// Unity ships weak no-op fixtures, so a setUp() inside the anonymous namespace
+// above would be silently ignored and the tests would leak state into each
+// other.
+void setUp() {
+    applet.reset();
+    credential.reset();
+    diagnostics.downloadModeSupported = true;
+    diagnostics.enrollSupported = true;
+    diagnostics.forgetSupported = true;
+    diagnostics.forgetRequests = 0;
+    diagnostics.downloadModeRequests = 0;
+    diagnostics.enrolledTemplates = 2;
+    response.fill(0);
+}
+
+void tearDown() {}
+
+namespace {
+
+void test_selects_standard_piv_aid() {
+    selectApplet();
+    constexpr uint8_t expected[] = {
+        0x61, 0x11, 0x4F, 0x06, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00,
+        0x79, 0x07, 0x4F, 0x05, 0xA0, 0x00, 0x00, 0x03, 0x08,
+    };
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, response.data(), sizeof(expected));
+}
+
+void test_certificate_response_is_chained_without_truncation() {
+    selectApplet();
+    constexpr uint8_t getCertificate[] = {
+        0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x05, 0x00,
+    };
+    std::array<uint8_t, 320> reassembled{};
+    size_t reassembledLength = 0;
+    size_t responseLength = 0;
+    applet.transceive(getCertificate, sizeof(getCertificate), false,
+                      response.data(), response.size(), responseLength);
+    TEST_ASSERT_EQUAL_UINT32(258, responseLength);
+    TEST_ASSERT_EQUAL_HEX8(0x61, response[256]);
+    std::memcpy(reassembled.data(), response.data(), 256);
+    reassembledLength = 256;
+
+    constexpr uint8_t getResponseShort[] = {0x00, 0xC0, 0x00, 0x00, 0x10};
+    applet.transceive(getResponseShort, sizeof(getResponseShort), false,
+                      response.data(), response.size(), responseLength);
+    TEST_ASSERT_EQUAL_UINT32(18, responseLength);
+    TEST_ASSERT_EQUAL_HEX8(0x61, response[16]);
+    std::memcpy(reassembled.data() + reassembledLength, response.data(), 16);
+    reassembledLength += 16;
+
+    constexpr uint8_t getResponse[] = {0x00, 0xC0, 0x00, 0x00, 0x00};
+    applet.transceive(getResponse, sizeof(getResponse), false, response.data(),
+                      response.size(), responseLength);
+    TEST_ASSERT_GREATER_THAN_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX8(0x90, response[responseLength - 2]);
+    TEST_ASSERT_EQUAL_HEX8(0x00, response[responseLength - 1]);
+    std::memcpy(reassembled.data() + reassembledLength, response.data(),
+                responseLength - 2);
+    reassembledLength += responseLength - 2;
+
+    TEST_ASSERT_EQUAL_UINT32(313, reassembledLength);
+    constexpr uint8_t header[] = {0x53, 0x82, 0x01, 0x35,
+                                  0x70, 0x82, 0x01, 0x2C};
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(header, reassembled.data(), sizeof(header));
+    for (size_t index = 0; index < 300; ++index) {
+        TEST_ASSERT_EQUAL_HEX8(static_cast<uint8_t>(index),
+                               reassembled[8 + index]);
+    }
+    constexpr uint8_t trailer[] = {0x71, 0x01, 0x00, 0xFE, 0x00};
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(trailer, reassembled.data() + 308,
+                                  sizeof(trailer));
+}
+
+void test_public_card_objects_include_device_identifier() {
+    selectApplet();
+    constexpr uint8_t getChuid[] = {
+        0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x02, 0x00,
+    };
+    size_t responseLength = 0;
+    applet.transceive(getChuid, sizeof(getChuid), false, response.data(),
+                      response.size(), responseLength);
+    TEST_ASSERT_EQUAL_UINT32(63, responseLength);
+    TEST_ASSERT_EQUAL_HEX8(0x53, response[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x3B, response[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x40, response[37]);
+    TEST_ASSERT_EQUAL_HEX8(0x80, response[39]);
+
+    constexpr uint8_t getCcc[] = {
+        0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x07, 0x00,
+    };
+    applet.transceive(getCcc, sizeof(getCcc), false, response.data(),
+                      response.size(), responseLength);
+    TEST_ASSERT_EQUAL_UINT32(55, responseLength);
+    TEST_ASSERT_EQUAL_HEX8(0x53, response[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x33, response[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x90, response[responseLength - 2]);
+}
+
+void test_general_authenticate_waits_for_user_presence() {
+    selectApplet();
+    std::array<uint8_t, 44> authenticate = {
+        0x00, 0x87, 0x11, 0x9A, 0x26, 0x7C, 0x24, 0x82, 0x00, 0x81, 0x20,
+    };
+    for (size_t index = 0; index < 32; ++index) {
+        authenticate[11 + index] = static_cast<uint8_t>(index);
+    }
+    authenticate[43] = 0x00;
+
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(authenticate.data(), authenticate.size(),
+                                        false, response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(0, responseLength);
+
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(authenticate.data(), authenticate.size(),
+                                        true, response.data(), response.size(),
+                                        responseLength));
+    constexpr uint8_t expected[] = {0x7C, 0x0A, 0x82, 0x08, 0x30, 0x06,
+                                    0x02, 0x01, 0x01, 0x02, 0x01, 0x02,
+                                    0x90, 0x00};
+    TEST_ASSERT_EQUAL_UINT32(sizeof(expected), responseLength);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, response.data(), sizeof(expected));
+}
+
+void test_verify_authorizes_exactly_one_signature() {
+    selectApplet();
+    constexpr uint8_t verify[] = {
+        0x00, 0x20, 0x00, 0x80, 0x08, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(verify, sizeof(verify), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(verify, sizeof(verify), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+
+    std::array<uint8_t, 44> authenticate = {
+        0x00, 0x87, 0x11, 0x9A, 0x26, 0x7C, 0x24, 0x82, 0x00, 0x81, 0x20,
+    };
+    authenticate[43] = 0x00;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(authenticate.data(), authenticate.size(),
+                                        false, response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(authenticate.data(), authenticate.size(),
+                                        false, response.data(), response.size(),
+                                        responseLength));
+}
+
+void test_verify_status_query_does_not_request_a_fingerprint() {
+    selectApplet();
+    constexpr uint8_t verifyStatus[] = {0x00, 0x20, 0x00, 0x80};
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(verifyStatus, sizeof(verifyStatus),
+                                        false, response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX8(0x63, response[0]);
+    TEST_ASSERT_EQUAL_HEX8(0xC3, response[1]);
+}
+
+void test_generate_key_pair_is_gated_and_returns_public_point() {
+    selectApplet();
+    constexpr uint8_t generate[] = {0x00, 0x47, 0x00, 0x9A, 0x05,
+                                    0xAC, 0x03, 0x80, 0x01, 0x11, 0x00};
+    const size_t before = credential.generatedKeys;
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(generate, sizeof(generate), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(before, credential.generatedKeys);
+
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(generate, sizeof(generate), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(before + 1, credential.generatedKeys);
+    TEST_ASSERT_EQUAL_UINT32(72, responseLength);
+    constexpr uint8_t header[] = {0x7F, 0x49, 0x43, 0x86, 0x41, 0x04};
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(header, response.data(), sizeof(header));
+    TEST_ASSERT_EQUAL_HEX8(0x90, response[70]);
+    TEST_ASSERT_EQUAL_HEX8(0x00, response[71]);
+}
+
+void test_generate_key_pair_rejects_non_p256_algorithm() {
+    selectApplet();
+    constexpr uint8_t generate[] = {0x00, 0x47, 0x00, 0x9A, 0x05,
+                                    0xAC, 0x03, 0x80, 0x01, 0x07, 0x00};
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(generate, sizeof(generate), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX16(0x6A80, static_cast<uint16_t>(response[0] << 8 |
+                                                          response[1]));
+}
+
+void test_put_data_is_gated_and_replaces_certificate() {
+    selectApplet();
+    constexpr uint8_t putCertificate[] = {
+        0x00, 0xDB, 0x3F, 0xFF, 0x14, 0x5C, 0x03, 0x5F, 0xC1,
+        0x05, 0x53, 0x0D, 0x70, 0x06, 0xA1, 0xA2, 0xA3, 0xA4,
+        0xA5, 0xA6, 0x71, 0x01, 0x00, 0xFE, 0x00,
+    };
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(putCertificate, sizeof(putCertificate),
+                                        false, response.data(),
+                                        response.size(), responseLength));
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(putCertificate, sizeof(putCertificate),
+                                        true, response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX16(0x9000, static_cast<uint16_t>(response[0] << 8 |
+                                                          response[1]));
+
+    constexpr uint8_t getCertificate[] = {
+        0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x05, 0x00,
+    };
+    applet.transceive(getCertificate, sizeof(getCertificate), false,
+                      response.data(), response.size(), responseLength);
+    constexpr uint8_t expected[] = {0x53, 0x0D, 0x70, 0x06, 0xA1, 0xA2,
+                                    0xA3, 0xA4, 0xA5, 0xA6, 0x71, 0x01,
+                                    0x00, 0xFE, 0x00, 0x90, 0x00};
+    TEST_ASSERT_EQUAL_UINT32(sizeof(expected), responseLength);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, response.data(),
+                                  sizeof(expected));
+}
+
+void test_put_data_rejects_unknown_object() {
+    selectApplet();
+    constexpr uint8_t putUnknown[] = {
+        0x00, 0xDB, 0x3F, 0xFF, 0x0B, 0x5C, 0x03, 0x5F, 0xC1,
+        0x0A, 0x53, 0x04, 0x70, 0x02, 0xA1, 0xA2,
+    };
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(putUnknown, sizeof(putUnknown), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX16(0x6A82, static_cast<uint16_t>(response[0] << 8 |
+                                                          response[1]));
+}
+
+void test_unprovisioned_board_serves_no_public_objects() {
+    credential.forget();
+    selectApplet();
+    constexpr uint8_t objects[][11] = {
+        {0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x05, 0x00},
+        {0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x02, 0x00},
+        {0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x07, 0x00},
+    };
+    for (const auto &object : objects) {
+        size_t responseLength = 0;
+        TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                          applet.transceive(object, sizeof(object), false,
+                                            response.data(), response.size(),
+                                            responseLength));
+        TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+        TEST_ASSERT_EQUAL_HEX16(
+            0x6A82, static_cast<uint16_t>(response[0] << 8 | response[1]));
+    }
+}
+
+// A factory board has no identity and no enrolled finger, so provisioning has
+// to run without one. The window has to shut the moment the certificate lands,
+// or any host could replace the identity for the life of the device.
+void test_unprovisioned_board_provisions_without_a_fingerprint() {
+    credential.forget();
+    selectApplet();
+    constexpr uint8_t generate[] = {0x00, 0x47, 0x00, 0x9A, 0x05,
+                                    0xAC, 0x03, 0x80, 0x01, 0x11, 0x00};
+    constexpr uint8_t putCertificate[] = {
+        0x00, 0xDB, 0x3F, 0xFF, 0x14, 0x5C, 0x03, 0x5F, 0xC1,
+        0x05, 0x53, 0x0D, 0x70, 0x06, 0xA1, 0xA2, 0xA3, 0xA4,
+        0xA5, 0xA6, 0x71, 0x01, 0x00, 0xFE, 0x00,
+    };
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(generate, sizeof(generate), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(1, credential.generatedKeys);
+    TEST_ASSERT_EQUAL_UINT32(72, responseLength);
+
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(putCertificate, sizeof(putCertificate),
+                                        false, response.data(),
+                                        response.size(), responseLength));
+    TEST_ASSERT_EQUAL_HEX16(0x9000, static_cast<uint16_t>(response[0] << 8 |
+                                                          response[1]));
+
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(generate, sizeof(generate), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(putCertificate, sizeof(putCertificate),
+                                        false, response.data(),
+                                        response.size(), responseLength));
+    TEST_ASSERT_EQUAL_UINT32(1, credential.generatedKeys);
+}
+
+void test_unprovisioned_board_refuses_to_sign_without_waiting() {
+    credential.forget();
+    selectApplet();
+    std::array<uint8_t, 44> authenticate = {
+        0x00, 0x87, 0x11, 0x9A, 0x26, 0x7C, 0x24, 0x82, 0x00, 0x81, 0x20,
+    };
+    authenticate[43] = 0x00;
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(authenticate.data(),
+                                        authenticate.size(), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX16(0x6A88, static_cast<uint16_t>(response[0] << 8 |
+                                                          response[1]));
+}
+
+void test_rate_limiter_locks_backs_off_and_resets() {
+    deskid::RateLimiter limiter(3, 1000, 4000);
+
+    limiter.recordFailure(0);
+    limiter.recordFailure(0);
+    TEST_ASSERT_FALSE(limiter.locked(0));
+    limiter.recordFailure(0);
+    TEST_ASSERT_TRUE(limiter.locked(0));
+    TEST_ASSERT_TRUE(limiter.locked(999));
+    TEST_ASSERT_FALSE(limiter.locked(1000));
+
+    limiter.recordFailure(1000);
+    limiter.recordFailure(1000);
+    limiter.recordFailure(1000);
+    TEST_ASSERT_TRUE(limiter.locked(2999));
+    TEST_ASSERT_FALSE(limiter.locked(3000));
+
+    limiter.recordFailure(3000);
+    limiter.recordFailure(3000);
+    limiter.recordFailure(3000);
+    TEST_ASSERT_TRUE(limiter.locked(6999));
+    TEST_ASSERT_FALSE(limiter.locked(7000));
+
+    limiter.recordSuccess();
+    limiter.recordFailure(7000);
+    limiter.recordFailure(7000);
+    TEST_ASSERT_FALSE(limiter.locked(7000));
+    limiter.recordFailure(7000);
+    TEST_ASSERT_TRUE(limiter.locked(7999));
+    TEST_ASSERT_FALSE(limiter.locked(8000));
+}
+
+// Unplugging the device is the cheapest attack there is, so a restored lockout
+// is re-armed in full and the failure count picks up where it left off.
+void test_lockout_survives_a_power_cycle() {
+    deskid::RateLimiter limiter(3, 1000, 4000);
+    limiter.recordFailure(0);
+    limiter.recordFailure(0);
+    limiter.recordFailure(0);
+    TEST_ASSERT_TRUE(limiter.locked(0));
+    TEST_ASSERT_EQUAL_UINT32(1, limiter.lockoutCount());
+
+    deskid::RateLimiter rebooted(3, 1000, 4000);
+    rebooted.restore(limiter.consecutiveFailures(), limiter.lockoutCount(), 0);
+    TEST_ASSERT_TRUE(rebooted.locked(999));
+    TEST_ASSERT_FALSE(rebooted.locked(1000));
+    rebooted.recordFailure(1000);
+    rebooted.recordFailure(1000);
+    rebooted.recordFailure(1000);
+    TEST_ASSERT_TRUE(rebooted.locked(2999));
+    TEST_ASSERT_FALSE(rebooted.locked(3000));
+
+    deskid::RateLimiter resumed(3, 1000, 4000);
+    resumed.restore(2, 0, 0);
+    TEST_ASSERT_FALSE(resumed.locked(0));
+    resumed.recordFailure(0);
+    TEST_ASSERT_TRUE(resumed.locked(0));
+}
+
+void test_rejects_malformed_authentication_template() {
+    selectApplet();
+    constexpr uint8_t malformed[] = {0x00, 0x87, 0x11, 0x9A, 0x04,
+                                     0x7C, 0x02, 0x82, 0x00};
+    size_t responseLength = 0;
+    applet.transceive(malformed, sizeof(malformed), true, response.data(),
+                      response.size(), responseLength);
+    TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX16(0x6A80,
+                            static_cast<uint16_t>(response[0] << 8 | response[1]));
+}
+
+void test_piv_aid_is_refused_unless_allowed() {
+    constexpr uint8_t select[] = {0x00, 0xA4, 0x04, 0x00, 0x05,
+                                  0xA0, 0x00, 0x00, 0x03, 0x08};
+    size_t responseLength = 0;
+    applet.transceive(select, sizeof(select), false, response.data(),
+                      response.size(), responseLength);
+    TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX16(0x6A82,
+                            static_cast<uint16_t>(response[0] << 8 | response[1]));
+}
+
+void test_status_object_reports_device_state_without_user_presence() {
+    selectApplet();
+    constexpr uint8_t getStatus[] = {
+        0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xFF, 0x01, 0x00,
+    };
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(getStatus, sizeof(getStatus), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    constexpr uint8_t expected[] = {
+        0x53, 0x57, 0x01, 0x05, 0x39, 0x2E, 0x39, 0x2E, 0x39, 0x02, 0x01,
+        0x02, 0x03, 0x04, 0x00, 0x01, 0x02, 0x03, 0x04, 0x01, 0x04, 0x05,
+        0x04, 0x00, 0x04, 0xAB, 0xCD, 0x06, 0x01, 0x01, 0x07, 0x01, 0x09,
+        0x08, 0x01, 0x01, 0x09, 0x01, 0x03, 0x0A, 0x04, 0x00, 0x00, 0x00,
+        0x2A, 0x0B, 0x04, 0x00, 0x00, 0x00, 0x02, 0x0C, 0x01, 0x01, 0x0D,
+        0x04, 0x00, 0x00, 0x04, 0xD2, 0x0E, 0x01, 0x00, 0x0F, 0x01, 0x00,
+        0x10, 0x04, 0x00, 0x00, 0x00, 0x00, 0x11, 0x04, 0x00, 0x00, 0x00,
+        0x07, 0x12, 0x01, 0x0B, 0x13, 0x01, 0x02, 0x14, 0x01, 0x2A,
+        0xFE, 0x00, 0x90, 0x00,
+    };
+    TEST_ASSERT_EQUAL_UINT32(sizeof(expected), responseLength);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, response.data(), sizeof(expected));
+}
+
+void test_download_mode_is_gated_by_user_presence() {
+    selectApplet();
+    constexpr uint8_t downloadMode[] = {0x80, 0xF0, 0x00, 0x00, 0x00};
+    const size_t before = diagnostics.downloadModeRequests;
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(downloadMode, sizeof(downloadMode),
+                                        false, response.data(),
+                                        response.size(), responseLength));
+    TEST_ASSERT_EQUAL_UINT32(before, diagnostics.downloadModeRequests);
+
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(downloadMode, sizeof(downloadMode),
+                                        true, response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(before + 1, diagnostics.downloadModeRequests);
+    TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX16(0x9000, static_cast<uint16_t>(response[0] << 8 |
+                                                          response[1]));
+}
+
+void test_download_mode_declined_reports_unsupported_instruction() {
+    selectApplet();
+    diagnostics.downloadModeSupported = false;
+    constexpr uint8_t downloadMode[] = {0x80, 0xF0, 0x00, 0x00, 0x00};
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(downloadMode, sizeof(downloadMode),
+                                        true, response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX16(0x6D00, static_cast<uint16_t>(response[0] << 8 |
+                                                          response[1]));
+}
+
+void test_enrollment_is_open_while_the_sensor_library_is_empty() {
+    selectApplet();
+    diagnostics.enrolledTemplates = 0;
+    diagnostics.enrollStage = 1;
+    constexpr uint8_t enroll[] = {0x80, 0xE1, 0x00, 0x00, 0x00};
+    const size_t before = diagnostics.enrollRequests;
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(enroll, sizeof(enroll), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(before + 1, diagnostics.enrollRequests);
+    constexpr uint8_t expected[] = {0x01, 0x90, 0x00};
+    TEST_ASSERT_EQUAL_UINT32(sizeof(expected), responseLength);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, response.data(), sizeof(expected));
+}
+
+void test_enrollment_requires_a_match_once_a_finger_is_enrolled() {
+    selectApplet();
+    diagnostics.enrollStage = 3;
+    constexpr uint8_t enroll[] = {0x80, 0xE1, 0x00, 0x00, 0x00};
+    const size_t before = diagnostics.enrollRequests;
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(enroll, sizeof(enroll), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(before, diagnostics.enrollRequests);
+
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(enroll, sizeof(enroll), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(before + 1, diagnostics.enrollRequests);
+    constexpr uint8_t expected[] = {0x03, 0x90, 0x00};
+    TEST_ASSERT_EQUAL_UINT32(sizeof(expected), responseLength);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, response.data(), sizeof(expected));
+}
+
+void test_enrollment_declined_reports_unsupported_instruction() {
+    selectApplet();
+    diagnostics.enrolledTemplates = 0;
+    diagnostics.enrollSupported = false;
+    constexpr uint8_t enroll[] = {0x80, 0xE1, 0x00, 0x00, 0x00};
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(enroll, sizeof(enroll), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX16(0x6D00, static_cast<uint16_t>(response[0] << 8 |
+                                                          response[1]));
+}
+
+void test_forgetting_fingerprints_requires_a_match() {
+    selectApplet();
+    constexpr uint8_t forget[] = {0x80, 0xE2, 0x00, 0x00, 0x00};
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(forget, sizeof(forget), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(0, diagnostics.forgetRequests);
+
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(forget, sizeof(forget), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.forgetRequests);
+    TEST_ASSERT_EQUAL_UINT32(0, diagnostics.enrolledTemplates);
+    TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX16(0x9000, static_cast<uint16_t>(response[0] << 8 |
+                                                          response[1]));
+}
+
+// An empty library cannot produce the match that would authorize emptying it,
+// so the request has to succeed on its own rather than deadlock the recovery.
+void test_forgetting_an_empty_library_needs_no_match() {
+    selectApplet();
+    diagnostics.enrolledTemplates = 0;
+    constexpr uint8_t forget[] = {0x80, 0xE2, 0x00, 0x00, 0x00};
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(forget, sizeof(forget), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(0, diagnostics.forgetRequests);
+    TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX16(0x9000, static_cast<uint16_t>(response[0] << 8 |
+                                                          response[1]));
+}
+
+void test_forgetting_declined_reports_unsupported_instruction() {
+    selectApplet();
+    diagnostics.forgetSupported = false;
+    constexpr uint8_t forget[] = {0x80, 0xE2, 0x00, 0x00, 0x00};
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(forget, sizeof(forget), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX16(0x6D00, static_cast<uint16_t>(response[0] << 8 |
+                                                          response[1]));
+}
+
+}  // namespace
+
+void test_early_touch_answers_only_the_login_instructions() {
+    deskid::EarlyTouch touch(15000);
+    TEST_ASSERT_FALSE(touch.held(1000));
+    TEST_ASSERT_FALSE(touch.spend(0x87, 1000));
+
+    touch.record(1000);
+    TEST_ASSERT_TRUE(touch.held(1000));
+    // Enrolling a finger, writing a key or a certificate, emptying the sensor
+    // and rebooting into download mode all still cost a live match.
+    TEST_ASSERT_FALSE(touch.spend(0xE1, 2000));
+    TEST_ASSERT_FALSE(touch.spend(0xE2, 2000));
+    TEST_ASSERT_FALSE(touch.spend(0x47, 2000));
+    TEST_ASSERT_FALSE(touch.spend(0xDB, 2000));
+    TEST_ASSERT_FALSE(touch.spend(0xF0, 2000));
+    TEST_ASSERT_TRUE(touch.held(2000));
+    TEST_ASSERT_EQUAL_UINT32(0, touch.gates());
+
+    TEST_ASSERT_TRUE(touch.spend(0x20, 2000));
+    TEST_ASSERT_EQUAL_UINT32(1, touch.gates());
+}
+
+void test_early_touch_is_single_use_and_expires() {
+    deskid::EarlyTouch touch(15000);
+    touch.record(1000);
+    TEST_ASSERT_TRUE(touch.spend(0x87, 1100));
+    // One touch is one operation: a second signature has to be asked for.
+    TEST_ASSERT_FALSE(touch.spend(0x87, 1100));
+    TEST_ASSERT_FALSE(touch.held(1100));
+    TEST_ASSERT_EQUAL_UINT64(0, touch.millisecondsRemaining(1100));
+
+    touch.record(2000);
+    TEST_ASSERT_EQUAL_UINT64(15000, touch.millisecondsRemaining(2000));
+    TEST_ASSERT_EQUAL_UINT64(1, touch.millisecondsRemaining(16999));
+    // The window is the security trade, so it has to actually close.
+    TEST_ASSERT_FALSE(touch.held(17000));
+    TEST_ASSERT_FALSE(touch.spend(0x87, 17000));
+    TEST_ASSERT_EQUAL_UINT32(1, touch.gates());
+
+    touch.record(20000);
+    touch.clear();
+    TEST_ASSERT_FALSE(touch.held(20000));
+}
+
+void test_arm_ring_needs_no_fingerprint_and_takes_a_duration() {
+    selectApplet();
+    // Arming releases nothing and reveals nothing — it only asks the board to
+    // look at its own sensor — so demanding a match to ask for one would mean
+    // touching the ring to make the ring watchable.
+    constexpr uint8_t arm[] = {0x80, 0xE3, 0x00, 0x00, 0x01, 0x3C};
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(arm, sizeof(arm), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT8(0x90, response[0]);
+    TEST_ASSERT_EQUAL_UINT8(0x00, response[1]);
+    TEST_ASSERT_EQUAL_UINT8(0x3C, diagnostics.armedSeconds);
+
+    constexpr uint8_t noDuration[] = {0x80, 0xE3, 0x00, 0x00, 0x00};
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(noDuration, sizeof(noDuration), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT8(0x6A, response[0]);
+    TEST_ASSERT_EQUAL_UINT8(0x86, response[1]);
+}
+
+void test_selecting_the_applet_arms_the_ring() {
+    diagnostics.armedSeconds = 0;
+    // A fresh selection is the host saying it cares about this card now, which
+    // at the lock screen is the moment the user walks up. Re-selecting an
+    // already selected applet must not extend it, or a chatty host turns a
+    // bounded window into a permanent one.
+    selectApplet();
+    TEST_ASSERT_EQUAL_UINT8(deskid::kArmOnSelectSeconds, diagnostics.armedSeconds);
+
+    diagnostics.armedSeconds = 0;
+    selectApplet();
+    TEST_ASSERT_EQUAL_UINT8(0, diagnostics.armedSeconds);
+
+    applet.reset();
+    selectApplet();
+    TEST_ASSERT_EQUAL_UINT8(deskid::kArmOnSelectSeconds, diagnostics.armedSeconds);
+}
+
+int main(int, char **) {
+    UNITY_BEGIN();
+    RUN_TEST(test_selects_standard_piv_aid);
+    RUN_TEST(test_certificate_response_is_chained_without_truncation);
+    RUN_TEST(test_public_card_objects_include_device_identifier);
+    RUN_TEST(test_general_authenticate_waits_for_user_presence);
+    RUN_TEST(test_verify_authorizes_exactly_one_signature);
+    RUN_TEST(test_verify_status_query_does_not_request_a_fingerprint);
+    RUN_TEST(test_rejects_malformed_authentication_template);
+    RUN_TEST(test_generate_key_pair_is_gated_and_returns_public_point);
+    RUN_TEST(test_generate_key_pair_rejects_non_p256_algorithm);
+    RUN_TEST(test_put_data_is_gated_and_replaces_certificate);
+    RUN_TEST(test_put_data_rejects_unknown_object);
+    RUN_TEST(test_unprovisioned_board_serves_no_public_objects);
+    RUN_TEST(test_unprovisioned_board_provisions_without_a_fingerprint);
+    RUN_TEST(test_unprovisioned_board_refuses_to_sign_without_waiting);
+    RUN_TEST(test_rate_limiter_locks_backs_off_and_resets);
+    RUN_TEST(test_lockout_survives_a_power_cycle);
+    RUN_TEST(test_piv_aid_is_refused_unless_allowed);
+    RUN_TEST(test_status_object_reports_device_state_without_user_presence);
+    RUN_TEST(test_download_mode_is_gated_by_user_presence);
+    RUN_TEST(test_download_mode_declined_reports_unsupported_instruction);
+    RUN_TEST(test_enrollment_is_open_while_the_sensor_library_is_empty);
+    RUN_TEST(test_enrollment_requires_a_match_once_a_finger_is_enrolled);
+    RUN_TEST(test_enrollment_declined_reports_unsupported_instruction);
+    RUN_TEST(test_forgetting_fingerprints_requires_a_match);
+    RUN_TEST(test_forgetting_an_empty_library_needs_no_match);
+    RUN_TEST(test_forgetting_declined_reports_unsupported_instruction);
+    RUN_TEST(test_arm_ring_needs_no_fingerprint_and_takes_a_duration);
+    RUN_TEST(test_selecting_the_applet_arms_the_ring);
+    RUN_TEST(test_early_touch_answers_only_the_login_instructions);
+    RUN_TEST(test_early_touch_is_single_use_and_expires);
+    return UNITY_END();
+}
