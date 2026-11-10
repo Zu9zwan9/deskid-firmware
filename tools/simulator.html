@@ -1,0 +1,1095 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="description" content="Interactive visual simulator for the DeskID fingerprint-gated CCID/PIV authentication flow.">
+    <title>DeskID Authentication Simulator</title>
+    <style>
+        :root {
+            color-scheme: light;
+            --canvas: #f2f3f0;
+            --surface: #ffffff;
+            --surface-subtle: #f7f8f5;
+            --ink: #171a18;
+            --muted: #666d68;
+            --line: #d9ddd8;
+            --line-strong: #c4cac4;
+            --blue: #0874d1;
+            --blue-dark: #075ca5;
+            --red: #bd3c34;
+            --green: #28764b;
+            --shadow: 0 18px 50px rgba(24, 31, 27, 0.08);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            min-width: 320px;
+            margin: 0;
+            background: var(--canvas);
+            color: var(--ink);
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        button {
+            font: inherit;
+        }
+
+        .page {
+            width: min(1180px, calc(100% - 40px));
+            margin: 0 auto;
+            padding: 28px 0 34px;
+        }
+
+        .topbar,
+        .brand,
+        .simulation-label,
+        .panel-heading,
+        .status-line,
+        .credential-row,
+        .timeline-heading,
+        .controls,
+        .footer {
+            display: flex;
+            align-items: center;
+        }
+
+        .topbar {
+            justify-content: space-between;
+            margin-bottom: 22px;
+        }
+
+        .brand {
+            gap: 11px;
+            font-size: 17px;
+            font-weight: 680;
+            letter-spacing: -0.02em;
+        }
+
+        .brand-mark {
+            display: grid;
+            width: 32px;
+            height: 32px;
+            place-items: center;
+            border-radius: 9px;
+            background: var(--ink);
+            color: #fff;
+            font-size: 14px;
+            letter-spacing: -0.04em;
+        }
+
+        .simulation-label {
+            gap: 8px;
+            color: var(--muted);
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+
+        .simulation-label::before {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--blue);
+            content: "";
+        }
+
+        .workspace {
+            display: grid;
+            grid-template-columns: minmax(0, 0.88fr) minmax(0, 1.12fr);
+            overflow: hidden;
+            min-height: 488px;
+            border: 1px solid var(--line);
+            border-radius: 24px;
+            background: var(--surface);
+            box-shadow: var(--shadow);
+        }
+
+        .device-panel,
+        .system-panel {
+            min-width: 0;
+            padding: 28px;
+        }
+
+        .device-panel {
+            display: flex;
+            flex-direction: column;
+            border-right: 1px solid var(--line);
+            background: var(--surface-subtle);
+        }
+
+        .panel-heading {
+            justify-content: space-between;
+            gap: 16px;
+        }
+
+        .eyebrow {
+            margin: 0;
+            color: var(--muted);
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.09em;
+            text-transform: uppercase;
+        }
+
+        .connection {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            color: var(--green);
+            font-size: 12px;
+            font-weight: 650;
+        }
+
+        .connection::before {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: currentColor;
+            content: "";
+        }
+
+        .device-stage {
+            display: grid;
+            flex: 1;
+            min-height: 320px;
+            place-items: center;
+            padding: 30px 0 22px;
+        }
+
+        .device {
+            position: relative;
+            width: min(258px, 82%);
+            aspect-ratio: 0.9;
+            border: 1px solid #303633;
+            border-radius: 34px;
+            background: #1c201e;
+            box-shadow: 0 22px 34px rgba(18, 22, 20, 0.2);
+        }
+
+        .device-wordmark {
+            position: absolute;
+            top: 27px;
+            left: 0;
+            width: 100%;
+            color: #aeb5b0;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.18em;
+            text-align: center;
+        }
+
+        .sensor {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            display: grid;
+            width: 130px;
+            height: 130px;
+            place-items: center;
+            transform: translate(-50%, -46%);
+            border: 2px solid #555d58;
+            border-radius: 50%;
+            background: #303633;
+            box-shadow: inset 0 0 0 10px #242926;
+            transition: border-color 180ms ease, box-shadow 180ms ease;
+        }
+
+        .sensor svg {
+            width: 54px;
+            color: #8d9690;
+            transition: color 180ms ease;
+        }
+
+        .usb-port {
+            position: absolute;
+            bottom: -1px;
+            left: 50%;
+            width: 52px;
+            height: 10px;
+            transform: translateX(-50%);
+            border: 1px solid #59615c;
+            border-bottom: 0;
+            border-radius: 8px 8px 0 0;
+            background: #0e110f;
+        }
+
+        body[data-phase="waiting"] .sensor {
+            border-color: #4ca5f0;
+            box-shadow: inset 0 0 0 10px #242926, 0 0 0 5px rgba(8, 116, 209, 0.18), 0 0 30px rgba(8, 116, 209, 0.36);
+            animation: breathe 1.9s ease-in-out infinite;
+        }
+
+        body[data-phase="waiting"] .sensor svg,
+        body[data-phase="matching"] .sensor svg {
+            color: #b9ddff;
+        }
+
+        body[data-phase="matching"] .sensor {
+            border-color: #65b6fa;
+            box-shadow: inset 0 0 0 10px #242926, 0 0 0 5px rgba(8, 116, 209, 0.25), 0 0 34px rgba(8, 116, 209, 0.48);
+        }
+
+        body[data-phase="retry"] .sensor {
+            border-color: #ef6257;
+            box-shadow: inset 0 0 0 10px #242926, 0 0 0 5px rgba(189, 60, 52, 0.2), 0 0 30px rgba(189, 60, 52, 0.38);
+            animation: flash 220ms linear 4;
+        }
+
+        body[data-phase="retry"] .sensor svg {
+            color: #ffc2bd;
+        }
+
+        .device-state {
+            text-align: center;
+        }
+
+        .device-state strong {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 17px;
+            letter-spacing: -0.02em;
+        }
+
+        .device-state span {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .system-panel {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            background: #eceeeb;
+        }
+
+        .system-label {
+            margin: 0 auto 14px;
+            color: var(--muted);
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .system-window {
+            width: min(100%, 520px);
+            margin: 0 auto;
+            overflow: hidden;
+            border: 1px solid var(--line-strong);
+            border-radius: 15px;
+            background: var(--surface);
+            box-shadow: 0 20px 45px rgba(20, 27, 23, 0.14);
+        }
+
+        .window-bar {
+            position: relative;
+            display: flex;
+            align-items: center;
+            height: 42px;
+            padding: 0 15px;
+            border-bottom: 1px solid var(--line);
+            background: #f5f6f3;
+        }
+
+        .window-dot {
+            width: 10px;
+            height: 10px;
+            margin-right: 7px;
+            border: 1px solid rgba(0, 0, 0, 0.12);
+            border-radius: 50%;
+        }
+
+        .window-dot:nth-child(1) { background: #ef6a5f; }
+        .window-dot:nth-child(2) { background: #e9bd4a; }
+        .window-dot:nth-child(3) { background: #61c454; }
+
+        .window-title {
+            position: absolute;
+            left: 50%;
+            transform: translateX(-50%);
+            color: #4e5550;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .prompt {
+            padding: 30px 34px 28px;
+        }
+
+        .prompt-icon {
+            display: grid;
+            width: 48px;
+            height: 48px;
+            margin-bottom: 22px;
+            place-items: center;
+            border-radius: 13px;
+            background: #e7eef5;
+            color: var(--blue-dark);
+        }
+
+        .prompt-icon svg {
+            width: 24px;
+        }
+
+        .prompt h1 {
+            margin: 6px 0 8px;
+            font-size: clamp(22px, 3vw, 28px);
+            line-height: 1.12;
+            letter-spacing: -0.035em;
+        }
+
+        .prompt-copy {
+            min-height: 42px;
+            margin: 0 0 24px;
+            color: var(--muted);
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        .credential {
+            overflow: hidden;
+            margin-bottom: 18px;
+            border: 1px solid var(--line);
+            border-radius: 11px;
+        }
+
+        .credential-row {
+            justify-content: space-between;
+            gap: 20px;
+            min-height: 40px;
+            padding: 0 13px;
+            font-size: 12px;
+        }
+
+        .credential-row + .credential-row {
+            border-top: 1px solid var(--line);
+        }
+
+        .credential-row span:first-child {
+            color: var(--muted);
+        }
+
+        .credential-row span:last-child {
+            font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+            font-size: 11px;
+        }
+
+        .status-line {
+            gap: 10px;
+            min-height: 42px;
+            padding: 10px 12px;
+            border-radius: 10px;
+            background: var(--surface-subtle);
+            color: #3d433f;
+            font-size: 13px;
+            line-height: 1.35;
+        }
+
+        .status-dot {
+            flex: 0 0 auto;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #909792;
+        }
+
+        body[data-phase="preparing"] .status-dot,
+        body[data-phase="waiting"] .status-dot,
+        body[data-phase="matching"] .status-dot {
+            background: var(--blue);
+        }
+
+        body[data-phase="retry"] .status-dot,
+        body[data-phase="denied"] .status-dot,
+        body[data-phase="cancelled"] .status-dot {
+            background: var(--red);
+        }
+
+        body[data-phase="success"] .status-dot {
+            background: var(--green);
+        }
+
+        .timeout {
+            margin-top: 14px;
+        }
+
+        .timeout-meta {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 7px;
+            color: var(--muted);
+            font-size: 11px;
+        }
+
+        .timeout-track {
+            overflow: hidden;
+            height: 3px;
+            border-radius: 2px;
+            background: #e1e4e0;
+        }
+
+        .timeout-fill {
+            width: 100%;
+            height: 100%;
+            transform: scaleX(1);
+            transform-origin: left;
+            background: var(--blue);
+        }
+
+        .timeline {
+            margin-top: 18px;
+            overflow: hidden;
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            background: var(--surface);
+        }
+
+        .timeline-heading {
+            justify-content: space-between;
+            min-height: 56px;
+            padding: 0 20px;
+            border-bottom: 1px solid var(--line);
+        }
+
+        .timeline-heading h2 {
+            margin: 0;
+            font-size: 14px;
+            letter-spacing: -0.01em;
+        }
+
+        .timeline-heading span {
+            color: var(--muted);
+            font-size: 11px;
+        }
+
+        .event-log {
+            max-height: 258px;
+            margin: 0;
+            padding: 0;
+            overflow-y: auto;
+            list-style: none;
+        }
+
+        .event,
+        .empty-event {
+            display: grid;
+            grid-template-columns: 62px 62px minmax(0, 1fr);
+            gap: 13px;
+            min-height: 58px;
+            padding: 13px 20px;
+            border-bottom: 1px solid #eceeeb;
+        }
+
+        .event:last-child,
+        .empty-event:last-child {
+            border-bottom: 0;
+        }
+
+        .event-time,
+        .event-kind {
+            padding-top: 2px;
+            font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+            font-size: 10px;
+        }
+
+        .event-time {
+            color: #858c87;
+        }
+
+        .event-kind {
+            color: var(--blue-dark);
+            font-weight: 700;
+            letter-spacing: 0.05em;
+        }
+
+        .event-title {
+            display: block;
+            margin-bottom: 3px;
+            font-size: 12px;
+            font-weight: 650;
+        }
+
+        .event-detail {
+            display: block;
+            overflow-wrap: anywhere;
+            color: var(--muted);
+            font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+            font-size: 10px;
+            line-height: 1.45;
+        }
+
+        .empty-event {
+            display: block;
+            padding: 22px 20px;
+            color: var(--muted);
+            font-size: 12px;
+            text-align: center;
+        }
+
+        .controls {
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 16px;
+            padding: 14px;
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            background: var(--surface);
+        }
+
+        .button {
+            min-height: 40px;
+            padding: 0 16px;
+            border: 1px solid var(--line-strong);
+            border-radius: 10px;
+            background: var(--surface);
+            color: var(--ink);
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 650;
+            transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
+        }
+
+        .button:hover:not(:disabled) {
+            border-color: #9ca49e;
+            background: #f5f6f3;
+        }
+
+        .button:active:not(:disabled) {
+            transform: translateY(1px);
+        }
+
+        .button:focus-visible {
+            outline: 3px solid rgba(8, 116, 209, 0.28);
+            outline-offset: 2px;
+        }
+
+        .button:disabled {
+            opacity: 0.38;
+            cursor: not-allowed;
+        }
+
+        .button-primary {
+            border-color: var(--blue);
+            background: var(--blue);
+            color: #fff;
+        }
+
+        .button-primary:hover:not(:disabled) {
+            border-color: var(--blue-dark);
+            background: var(--blue-dark);
+        }
+
+        .button-danger {
+            color: var(--red);
+        }
+
+        .control-spacer {
+            flex: 1;
+        }
+
+        .footer {
+            justify-content: space-between;
+            gap: 18px;
+            margin-top: 15px;
+            color: var(--muted);
+            font-size: 11px;
+            line-height: 1.45;
+        }
+
+        .footer strong {
+            color: #454b47;
+        }
+
+        @keyframes breathe {
+            0%, 100% { opacity: 0.72; }
+            50% { opacity: 1; }
+        }
+
+        @keyframes flash {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        @media (max-width: 800px) {
+            .workspace {
+                grid-template-columns: 1fr;
+            }
+
+            .device-panel {
+                border-right: 0;
+                border-bottom: 1px solid var(--line);
+            }
+
+            .device-stage {
+                min-height: 300px;
+            }
+        }
+
+        @media (max-width: 560px) {
+            .page {
+                width: min(100% - 22px, 1180px);
+                padding-top: 16px;
+            }
+
+            .simulation-label span {
+                display: none;
+            }
+
+            .device-panel,
+            .system-panel {
+                padding: 20px;
+            }
+
+            .prompt {
+                padding: 25px 22px 22px;
+            }
+
+            .event {
+                grid-template-columns: 52px minmax(0, 1fr);
+                gap: 9px;
+                padding-inline: 14px;
+            }
+
+            .event-kind {
+                display: none;
+            }
+
+            .controls .button {
+                flex: 1 1 calc(50% - 10px);
+            }
+
+            .control-spacer {
+                display: none;
+            }
+
+            .footer {
+                display: block;
+            }
+
+            .footer span {
+                display: block;
+                margin-top: 5px;
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                scroll-behavior: auto !important;
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+            }
+        }
+    </style>
+</head>
+<body data-phase="idle">
+    <div class="page">
+        <header class="topbar">
+            <div class="brand">
+                <span class="brand-mark" aria-hidden="true">D</span>
+                <span>DeskID</span>
+            </div>
+            <div class="simulation-label"><span>Interactive simulation</span></div>
+        </header>
+
+        <main>
+            <section class="workspace" aria-label="Authentication simulation">
+                <article class="device-panel">
+                    <div class="panel-heading">
+                        <p class="eyebrow">ESP32-S3 + R503</p>
+                        <span class="connection">Connected</span>
+                    </div>
+
+                    <div class="device-stage" aria-hidden="true">
+                        <div class="device">
+                            <span class="device-wordmark">DESKID</span>
+                            <div class="sensor">
+                                <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                                    <path d="M14 23.5c0-6 4.4-10.5 10-10.5s10 4.5 10 10.5c0 7.6-2.4 13.2-5.8 17"/>
+                                    <path d="M18 24c0-3.8 2.6-6.7 6-6.7s6 2.9 6 6.7c0 6.3-1.7 11-4.2 14.5"/>
+                                    <path d="M22 24.5c0-1.6.8-2.8 2-2.8s2 1.2 2 2.8c0 5.1-1 8.9-2.7 12"/>
+                                    <path d="M10 24c0-8.4 6.1-15 14-15 7.8 0 14 6.6 14 15 0 4.2-.6 7.9-1.9 11.2"/>
+                                    <path d="M13.5 33c-1-2.7-1.5-5.7-1.5-9"/>
+                                    <path d="M17 39c-1.2-2.6-2.2-5.4-2.7-8.4"/>
+                                </svg>
+                            </div>
+                            <span class="usb-port"></span>
+                        </div>
+                    </div>
+
+                    <div class="device-state" aria-live="polite">
+                        <strong id="deviceTitle">Sensor ready</strong>
+                        <span id="deviceDetail">Waiting for a host request</span>
+                    </div>
+                </article>
+
+                <article class="system-panel">
+                    <p class="system-label">Conceptual macOS state · actual UI is system-owned</p>
+                    <div class="system-window">
+                        <div class="window-bar" aria-hidden="true">
+                            <span class="window-dot"></span>
+                            <span class="window-dot"></span>
+                            <span class="window-dot"></span>
+                            <span class="window-title">Authentication</span>
+                        </div>
+                        <div class="prompt">
+                            <div class="prompt-icon" aria-hidden="true">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                                    <rect x="5" y="10" width="14" height="11" rx="3"></rect>
+                                    <path d="M8.5 10V7.5a3.5 3.5 0 0 1 7 0V10"></path>
+                                    <path d="M12 14v3"></path>
+                                </svg>
+                            </div>
+                            <p class="eyebrow">sudo authentication</p>
+                            <h1 id="promptTitle">Ready to simulate</h1>
+                            <p class="prompt-copy" id="promptCopy">Start a request to preview the host-driven DeskID authentication flow.</p>
+
+                            <div class="credential" aria-label="Simulated smart card identity">
+                                <div class="credential-row">
+                                    <span>Certificate</span>
+                                    <span>DeskID Test</span>
+                                </div>
+                                <div class="credential-row">
+                                    <span>PIV key</span>
+                                    <span>9A · ECC P-256</span>
+                                </div>
+                            </div>
+
+                            <div class="status-line" role="status" aria-live="polite">
+                                <span class="status-dot" aria-hidden="true"></span>
+                                <span id="statusText">No request in progress</span>
+                            </div>
+
+                            <div class="timeout" id="timeout" hidden>
+                                <div class="timeout-meta">
+                                    <span>Device presence timeout</span>
+                                    <span id="timeRemaining">30s</span>
+                                </div>
+                                <div class="timeout-track" aria-hidden="true">
+                                    <div class="timeout-fill" id="timeoutFill"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </article>
+            </section>
+
+            <section class="timeline" aria-labelledby="timelineTitle">
+                <div class="timeline-heading">
+                    <h2 id="timelineTitle">CCID / APDU timeline</h2>
+                    <span>Host → reader → PIV applet</span>
+                </div>
+                <ol class="event-log" id="eventLog">
+                    <li class="empty-event">Start an authentication request to inspect the protocol flow.</li>
+                </ol>
+            </section>
+
+            <section class="controls" aria-label="Simulation controls">
+                <button class="button button-primary" id="startButton" type="button">Start authentication</button>
+                <button class="button" id="matchButton" type="button" disabled>Match fingerprint</button>
+                <button class="button button-danger" id="rejectButton" type="button" disabled>No match</button>
+                <span class="control-spacer"></span>
+                <button class="button" id="cancelButton" type="button" disabled>Cancel request</button>
+            </section>
+        </main>
+
+        <footer class="footer">
+            <strong>Simulation only — this page does not call loginwindow, sudo, CryptoTokenKit, USB, or the fingerprint sensor.</strong>
+            <span>Actual macOS UI may show its standard smart-card PIN prompt.</span>
+        </footer>
+    </div>
+
+    <script>
+        "use strict";
+
+        const presenceTimeoutMs = 30000;
+        const timeExtensionIntervalMs = 750;
+        const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        const elements = {
+            body: document.body,
+            deviceTitle: document.querySelector("#deviceTitle"),
+            deviceDetail: document.querySelector("#deviceDetail"),
+            promptTitle: document.querySelector("#promptTitle"),
+            promptCopy: document.querySelector("#promptCopy"),
+            statusText: document.querySelector("#statusText"),
+            timeout: document.querySelector("#timeout"),
+            timeRemaining: document.querySelector("#timeRemaining"),
+            timeoutFill: document.querySelector("#timeoutFill"),
+            eventLog: document.querySelector("#eventLog"),
+            startButton: document.querySelector("#startButton"),
+            matchButton: document.querySelector("#matchButton"),
+            rejectButton: document.querySelector("#rejectButton"),
+            cancelButton: document.querySelector("#cancelButton")
+        };
+
+        const phaseCopy = {
+            idle: {
+                deviceTitle: "Sensor ready",
+                deviceDetail: "Waiting for a host request",
+                promptTitle: "Ready to simulate",
+                promptCopy: "Start a request to preview the host-driven DeskID authentication flow.",
+                status: "No request in progress"
+            },
+            preparing: {
+                deviceTitle: "Card request received",
+                deviceDetail: "Selecting the PIV application",
+                promptTitle: "Authentication requested",
+                promptCopy: "sudo is requesting a signature from the DeskID PIV identity.",
+                status: "Negotiating with the smart card"
+            },
+            waiting: {
+                deviceTitle: "Touch the sensor",
+                deviceDetail: "Breathing blue · 30-second request window",
+                promptTitle: "Touch DeskID to continue",
+                promptCopy: "The private key stays locked until the R503 matches an enrolled fingerprint.",
+                status: "Waiting for fingerprint verification"
+            },
+            retry: {
+                deviceTitle: "Fingerprint not recognized",
+                deviceDetail: "Lift your finger before trying again",
+                promptTitle: "Try your fingerprint again",
+                promptCopy: "The request is still pending while DeskID waits for another attempt.",
+                status: "No matching fingerprint template"
+            },
+            matching: {
+                deviceTitle: "Fingerprint matched",
+                deviceDetail: "Releasing one P-256 signature",
+                promptTitle: "Verifying with DeskID",
+                promptCopy: "The PIV applet is signing the host-provided SHA-256 digest.",
+                status: "Completing GENERAL AUTHENTICATE"
+            },
+            success: {
+                deviceTitle: "Authentication complete",
+                deviceDetail: "Sensor ready for the next request",
+                promptTitle: "Authentication approved",
+                promptCopy: "DeskID returned a valid P-256 signature for this request.",
+                status: "Signature accepted by macOS"
+            },
+            denied: {
+                deviceTitle: "Request timed out",
+                deviceDetail: "No fingerprint was authorized",
+                promptTitle: "Authentication denied",
+                promptCopy: "DeskID closed the request after the 30-second presence window.",
+                status: "Security status not satisfied · 69 82"
+            },
+            cancelled: {
+                deviceTitle: "Request cancelled",
+                deviceDetail: "Sensor ready for the next request",
+                promptTitle: "Authentication cancelled",
+                promptCopy: "The host aborted the pending CCID command before a signature was returned.",
+                status: "Request cancelled by the host"
+            }
+        };
+
+        const state = {
+            phase: "idle",
+            requestStartedAt: 0,
+            waitStartedAt: 0,
+            timeExtensionCount: 0,
+            timeExtensionEvent: null,
+            timers: new Set()
+        };
+
+        function later(callback, delay) {
+            const timer = window.setTimeout(() => {
+                state.timers.delete(timer);
+                callback();
+            }, delay);
+            state.timers.add(timer);
+        }
+
+        function repeat(callback, interval) {
+            const timer = window.setInterval(callback, interval);
+            state.timers.add(timer);
+        }
+
+        function stopTimers() {
+            state.timers.forEach((timer) => {
+                window.clearTimeout(timer);
+                window.clearInterval(timer);
+            });
+            state.timers.clear();
+        }
+
+        function setPhase(phase) {
+            state.phase = phase;
+            elements.body.dataset.phase = phase;
+            const copy = phaseCopy[phase];
+            elements.deviceTitle.textContent = copy.deviceTitle;
+            elements.deviceDetail.textContent = copy.deviceDetail;
+            elements.promptTitle.textContent = copy.promptTitle;
+            elements.promptCopy.textContent = copy.promptCopy;
+            elements.statusText.textContent = copy.status;
+
+            const waiting = phase === "waiting";
+            const pending = waiting || phase === "retry";
+            const terminal = phase === "idle" || phase === "success" || phase === "denied" || phase === "cancelled";
+            elements.startButton.disabled = !terminal;
+            elements.startButton.textContent = phase === "idle"
+                ? "Start authentication"
+                : terminal ? "Run again" : "Request in progress";
+            elements.matchButton.disabled = !waiting;
+            elements.rejectButton.disabled = !waiting;
+            elements.cancelButton.disabled = !pending;
+            elements.timeout.hidden = !pending;
+        }
+
+        function eventTimestamp() {
+            const elapsed = state.requestStartedAt === 0 ? 0 : performance.now() - state.requestStartedAt;
+            return `${(elapsed / 1000).toFixed(2)}s`;
+        }
+
+        function addEvent(kind, title, detail) {
+            const item = document.createElement("li");
+            item.className = "event";
+
+            const timestamp = document.createElement("span");
+            timestamp.className = "event-time";
+            timestamp.textContent = eventTimestamp();
+
+            const category = document.createElement("span");
+            category.className = "event-kind";
+            category.textContent = kind;
+
+            const content = document.createElement("span");
+            const heading = document.createElement("span");
+            heading.className = "event-title";
+            heading.textContent = title;
+            const description = document.createElement("span");
+            description.className = "event-detail";
+            description.textContent = detail;
+            content.append(heading, description);
+            item.append(timestamp, category, content);
+            elements.eventLog.append(item);
+            item.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "nearest" });
+            return item;
+        }
+
+        function clearEvents() {
+            elements.eventLog.replaceChildren();
+            state.timeExtensionEvent = null;
+            state.timeExtensionCount = 0;
+        }
+
+        function updateCountdown() {
+            const elapsed = performance.now() - state.waitStartedAt;
+            const remaining = Math.max(0, presenceTimeoutMs - elapsed);
+            elements.timeRemaining.textContent = `${Math.ceil(remaining / 1000)}s`;
+            elements.timeoutFill.style.transform = `scaleX(${remaining / presenceTimeoutMs})`;
+        }
+
+        function sendTimeExtension() {
+            if (state.phase !== "waiting" && state.phase !== "retry") {
+                return;
+            }
+            state.timeExtensionCount += 1;
+            if (state.timeExtensionEvent === null) {
+                state.timeExtensionEvent = addEvent(
+                    "CCID",
+                    "RDR_to_PC_DataBlock · time extension",
+                    "bStatus 80 · multiplier 1 · request remains pending"
+                );
+                return;
+            }
+            state.timeExtensionEvent.querySelector(".event-time").textContent = eventTimestamp();
+            state.timeExtensionEvent.querySelector(".event-detail").textContent =
+                `bStatus 80 · multiplier 1 · ${state.timeExtensionCount} extensions sent`;
+        }
+
+        function beginPresenceWait() {
+            state.waitStartedAt = performance.now();
+            setPhase("waiting");
+            updateCountdown();
+            sendTimeExtension();
+            repeat(sendTimeExtension, timeExtensionIntervalMs);
+            repeat(updateCountdown, 100);
+            later(timeoutRequest, presenceTimeoutMs);
+        }
+
+        function startRequest() {
+            stopTimers();
+            clearEvents();
+            state.requestStartedAt = performance.now();
+            setPhase("preparing");
+            elements.timeRemaining.textContent = "30s";
+            elements.timeoutFill.style.transform = "scaleX(1)";
+
+            addEvent("SYSTEM", "sudo requests a private-key signature", "CryptoTokenKit selects certificate ‘DeskID Test’");
+            later(() => addEvent("CCID", "PC_to_RDR_IccPowerOn", "slot 0 · sequence 00"), 180);
+            later(() => addEvent("APDU", "SELECT PIV application", "00 A4 04 00 · AID A000000308000010000100"), 380);
+            later(() => addEvent("CCID", "RDR_to_PC_DataBlock", "PIV application selected · 90 00"), 590);
+            later(() => {
+                addEvent("APDU", "VERIFY requests user presence", "00 20 00 80 08 FF FF FF FF FF FF FF FF · response deferred");
+                beginPresenceWait();
+            }, 820);
+        }
+
+        function matchFingerprint() {
+            if (state.phase !== "waiting") {
+                return;
+            }
+            stopTimers();
+            setPhase("matching");
+            addEvent("SENSOR", "R503 fingerprint matched", "template confidence passed the configured threshold");
+            later(() => addEvent("APDU", "VERIFY completed", "RDR_to_PC_DataBlock · 90 00"), 150);
+            later(() => addEvent("APDU", "GENERAL AUTHENTICATE", "00 87 11 9A · SHA-256 digest challenge"), 330);
+            later(() => addEvent("CRYPTO", "PSA Crypto signs with PIV key 9A", "ECDSA P-256 · private key remains on DeskID"), 500);
+            later(() => {
+                addEvent("CCID", "RDR_to_PC_DataBlock", "7C 82 <DER ECDSA signature> · 90 00");
+                setPhase("success");
+                addEvent("SYSTEM", "Signature accepted", "sudo authentication may continue");
+            }, 690);
+        }
+
+        function rejectFingerprint() {
+            if (state.phase !== "waiting") {
+                return;
+            }
+            setPhase("retry");
+            addEvent("SENSOR", "R503 found no matching template", "confirmation code 09 · red LED flashes");
+            later(() => {
+                if (state.phase !== "retry") {
+                    return;
+                }
+                addEvent("SENSOR", "Finger removed", "blue waiting state restored for another attempt");
+                setPhase("waiting");
+            }, 950);
+        }
+
+        function timeoutRequest() {
+            if (state.phase !== "waiting" && state.phase !== "retry") {
+                return;
+            }
+            stopTimers();
+            elements.timeRemaining.textContent = "0s";
+            elements.timeoutFill.style.transform = "scaleX(0)";
+            addEvent("APDU", "User presence timed out", "RDR_to_PC_DataBlock · 69 82");
+            setPhase("denied");
+            addEvent("SYSTEM", "Authentication rejected", "security status not satisfied");
+        }
+
+        function cancelRequest() {
+            if (state.phase !== "waiting" && state.phase !== "retry") {
+                return;
+            }
+            stopTimers();
+            addEvent("CCID", "PC_to_RDR_Abort", "host cancels the pending sequence");
+            addEvent("CCID", "RDR_to_PC_SlotStatus", "command aborted · no signature returned");
+            setPhase("cancelled");
+            addEvent("SYSTEM", "Authentication cancelled", "sudo receives no card signature");
+        }
+
+        elements.startButton.addEventListener("click", startRequest);
+        elements.matchButton.addEventListener("click", matchFingerprint);
+        elements.rejectButton.addEventListener("click", rejectFingerprint);
+        elements.cancelButton.addEventListener("click", cancelRequest);
+    </script>
+</body>
+</html>

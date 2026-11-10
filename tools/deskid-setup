@@ -1,0 +1,204 @@
+#!/bin/bash
+#
+# Build "DeskID Setup.app" — the setup app plus the DeskID token extension
+# that makes the card a login method — and open it.
+#
+#   tools/deskid-setup            build if stale, then launch
+#   tools/deskid-setup --build    build only; the app lands in dist/
+#   tools/deskid-setup --check    build, run the self-test, exit
+#   tools/deskid-setup --install  build, copy to /Applications, register the
+#                                 token extensions with pluginkit
+#   tools/deskid-setup --persistent   E1a: publish the card as a persistent
+#                                 token (no smart-card PIN panel); --smartcard undoes it
+#
+# Both binaries reach the card through CryptoTokenKit, which hands nothing to
+# a process without the com.apple.security.smartcard entitlement, so the app
+# is a bundle with a signature carrying that entitlement. Ad-hoc by default;
+# set CODESIGN_IDENTITY to sign with an Apple Development or Developer ID
+# identity for machines other than this one. No Xcode project, no python.
+
+set -eu
+
+readonly HERE="$(cd "$(dirname "$0")" && pwd)"
+readonly SOURCE="$HERE/deskid_setup.swift"
+readonly TOKEN_SOURCE="$HERE/deskid_token.swift"
+readonly PERSISTENT_SOURCE="$HERE/deskid_persistent_token.swift"
+readonly ASSIST_SOURCE="$HERE/deskid_assist.swift"
+readonly APP="$HERE/../dist/DeskID Setup.app"
+readonly BINARY="$APP/Contents/MacOS/DeskID Setup"
+readonly APPEX="$APP/Contents/PlugIns/DeskIDToken.appex"
+# Built beside the app, never inside it. pluginkit registers every extension
+# it finds in a registered bundle — `pluginkit -e ignore` is not honoured — so
+# an appex shipped in Contents/PlugIns is an enabled driver whether you asked
+# for one or not. Two drivers claiming one identity is the race that answers
+# "smartcard initialization error" at the lock screen. `--persistent` copies
+# this into the installed bundle on purpose.
+readonly PERSISTENT_APPEX="$HERE/../dist/DeskIDPersistent.appex"
+readonly IDENTITY="${CODESIGN_IDENTITY:--}"
+readonly LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+plist() {  # plist <path> <body>
+    { echo '<?xml version="1.0" encoding="UTF-8"?>'
+      echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+      echo '<plist version="1.0"><dict>'; echo "$2"; echo '</dict></plist>'; } > "$1"
+}
+
+if [ ! -x "$BINARY" ] || [ "$SOURCE" -nt "$BINARY" ] || [ "$TOKEN_SOURCE" -nt "$BINARY" ] \
+   || [ "$PERSISTENT_SOURCE" -nt "$BINARY" ] || [ "$ASSIST_SOURCE" -nt "$BINARY" ] \
+   || [ "$0" -nt "$BINARY" ]; then
+    echo "building DeskID Setup.app, about a minute the first time..." >&2
+    rm -rf "$APP"
+    rm -rf "$PERSISTENT_APPEX"
+    mkdir -p "$APP/Contents/MacOS" "$APPEX/Contents/MacOS" "$PERSISTENT_APPEX/Contents/MacOS"
+
+    plist "$APP/Contents/Info.plist" '
+    <key>CFBundleName</key>               <string>DeskID Setup</string>
+    <key>CFBundleDisplayName</key>        <string>DeskID Setup</string>
+    <key>CFBundleIdentifier</key>         <string>dev.deskid.setup</string>
+    <key>CFBundleExecutable</key>         <string>DeskID Setup</string>
+    <key>CFBundlePackageType</key>        <string>APPL</string>
+    <key>CFBundleShortVersionString</key> <string>1.0</string>
+    <key>CFBundleVersion</key>            <string>1</string>
+    <key>LSMinimumSystemVersion</key>     <string>14.0</string>
+    <key>LSApplicationCategoryType</key>  <string>public.app-category.utilities</string>
+    <key>NSHighResolutionCapable</key>    <true/>'
+
+    # com.apple.ctk.aid lists the applications this driver claims. The card
+    # answers the DeskID AID; the PIV AID is listed too so a board still on
+    # PIV-only firmware is claimed by this driver rather than Apple's.
+    plist "$APPEX/Contents/Info.plist" '
+    <key>CFBundleName</key>               <string>DeskIDToken</string>
+    <key>CFBundleIdentifier</key>         <string>dev.deskid.setup.token</string>
+    <key>CFBundleExecutable</key>         <string>DeskIDToken</string>
+    <key>CFBundlePackageType</key>        <string>XPC!</string>
+    <key>CFBundleShortVersionString</key> <string>1.0</string>
+    <key>CFBundleVersion</key>            <string>1</string>
+    <key>LSMinimumSystemVersion</key>     <string>14.0</string>
+    <key>NSExtension</key>
+    <dict>
+        <key>NSExtensionPointIdentifier</key> <string>com.apple.ctk-tokens</string>
+        <key>NSExtensionAttributes</key>
+        <dict>
+            <key>com.apple.ctk.token-type</key>   <string>smartcard</string>
+            <key>com.apple.ctk.class-id</key>     <string>dev.deskid.setup.token</string>
+            <key>com.apple.ctk.driver-class</key> <string>DeskIDToken.TokenDriver</string>
+            <key>com.apple.ctk.aid</key>
+            <array>
+                <string>F04465736B4944</string>
+                <string>A000000308</string>
+            </array>
+        </dict>
+    </dict>'
+
+    # The persistent-class driver: no AID, no token-type. The container app
+    # publishes the certificate for it with `DeskID Setup --persistent`.
+    plist "$PERSISTENT_APPEX/Contents/Info.plist" '
+    <key>CFBundleName</key>               <string>DeskIDPersistent</string>
+    <key>CFBundleIdentifier</key>         <string>dev.deskid.setup.persistent</string>
+    <key>CFBundleExecutable</key>         <string>DeskIDPersistent</string>
+    <key>CFBundlePackageType</key>        <string>XPC!</string>
+    <key>CFBundleShortVersionString</key> <string>1.0</string>
+    <key>CFBundleVersion</key>            <string>1</string>
+    <key>LSMinimumSystemVersion</key>     <string>14.0</string>
+    <key>NSExtension</key>
+    <dict>
+        <key>NSExtensionPointIdentifier</key> <string>com.apple.ctk-tokens</string>
+        <key>NSExtensionAttributes</key>
+        <dict>
+            <key>com.apple.ctk.class-id</key>     <string>dev.deskid.setup.persistent</string>
+            <key>com.apple.ctk.driver-class</key> <string>DeskIDPersistent.TokenDriver</string>
+        </dict>
+    </dict>'
+
+    readonly ENTITLEMENTS="$(mktemp -d -t deskid-entitlements)"
+    trap 'rm -rf "$ENTITLEMENTS"' EXIT
+    plist "$ENTITLEMENTS/app.plist" '
+    <key>com.apple.security.smartcard</key> <true/>'
+    plist "$ENTITLEMENTS/token.plist" '
+    <key>com.apple.security.app-sandbox</key> <true/>
+    <key>com.apple.security.smartcard</key>   <true/>'
+
+    xcrun swiftc -O -parse-as-library -application-extension -module-name DeskIDToken \
+        -Xlinker -e -Xlinker _NSExtensionMain \
+        "$TOKEN_SOURCE" -o "$APPEX/Contents/MacOS/DeskIDToken"
+    xcrun swiftc -O -parse-as-library -application-extension -module-name DeskIDPersistent \
+        -Xlinker -e -Xlinker _NSExtensionMain \
+        "$PERSISTENT_SOURCE" -o "$PERSISTENT_APPEX/Contents/MacOS/DeskIDPersistent"
+    # Swift allows top-level code only in a file called main.swift, and
+    # deskid_setup.swift is all top-level. Compiling it alone was fine; adding
+    # the assist module makes the name matter, so it is copied rather than
+    # renamed on disk or refactored into an @main type.
+    STAGE="$(mktemp -d)"
+    trap 'rm -rf "$STAGE"' EXIT
+    cp "$SOURCE" "$STAGE/main.swift"
+    xcrun swiftc -O "$STAGE/main.swift" "$ASSIST_SOURCE" -o "$BINARY"
+
+    codesign --sign "$IDENTITY" --force --options runtime \
+        --entitlements "$ENTITLEMENTS/token.plist" "$APPEX"
+    codesign --sign "$IDENTITY" --force --options runtime \
+        --entitlements "$ENTITLEMENTS/token.plist" "$PERSISTENT_APPEX"
+    codesign --sign "$IDENTITY" --force --options runtime \
+        --entitlements "$ENTITLEMENTS/app.plist" "$APP"
+fi
+
+case "${1:-}" in
+    --build)   echo "$APP" ;;
+    --check)   exec "$BINARY" --check ;;
+    --persistent)
+        readonly TARGET="/Applications/DeskID Setup.app/Contents/PlugIns/DeskIDPersistent.appex"
+        cp -R "$PERSISTENT_APPEX" "$TARGET"
+        /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+            -f "/Applications/DeskID Setup.app"
+        pluginkit -a "$TARGET"
+        pluginkit -e use -i dev.deskid.setup.persistent
+        # E1a, measured 2026-09-02 and FAILED: SecurityAgent still draws its
+        # PIN panel for a paired persistent token and then reports "smartcard
+        # initialization error". Kept as the experiment record; --smartcard
+        # undoes it. Parking the smart-card appex is the only way to stop
+        # ctkd attaching it — `pluginkit -e ignore` is not honoured.
+        readonly INSTALLED="/Applications/DeskID Setup.app/Contents/PlugIns/DeskIDToken.appex"
+        pluginkit -r "$INSTALLED" 2>/dev/null || true
+        mv "$INSTALLED" "$INSTALLED.parked" 2>/dev/null || true
+        exec "/Applications/DeskID Setup.app/Contents/MacOS/DeskID Setup" --persistent
+        ;;
+    --smartcard)
+        readonly INSTALLED="/Applications/DeskID Setup.app/Contents/PlugIns/DeskIDToken.appex"
+        [ -d "$INSTALLED.parked" ] && mv "$INSTALLED.parked" "$INSTALLED"
+        /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+            -f "/Applications/DeskID Setup.app"
+        pluginkit -a "$INSTALLED"
+        "/Applications/DeskID Setup.app/Contents/MacOS/DeskID Setup" --forget-persistent
+        pluginkit -r "/Applications/DeskID Setup.app/Contents/PlugIns/DeskIDPersistent.appex" \
+            2>/dev/null || true
+        rm -rf "/Applications/DeskID Setup.app/Contents/PlugIns/DeskIDPersistent.appex"
+        echo "smart-card driver restored; replug the board"
+        ;;
+    --install)
+        # Extensions only load from an installed, registered container.
+        rm -rf "/Applications/DeskID Setup.app"
+        cp -R "$APP" /Applications/
+        # LaunchServices has to know the container before pluginkit will list
+        # the extension inside it.
+        /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+            -f "/Applications/DeskID Setup.app"
+        pluginkit -a "/Applications/DeskID Setup.app/Contents/PlugIns/DeskIDToken.appex"
+        pluginkit -e use -i dev.deskid.setup.token
+        # What `sc_auth enable_for_login -c <class-id>` does, without the
+        # pluginkit lookup that fails under elevation. Until an app bundle is
+        # trusted, SecurityAgent will not offer its token class at any prompt
+        # and every gate silently falls back to the account password. This
+        # sits here because the copy above replaced the bundle and took the
+        # previous marking with it.
+        "$LSREGISTER" -trusted "/Applications/DeskID Setup.app"
+        # The persistent appex ships in the bundle as the E1a experiment record
+        # and is deliberately NOT registered here. Registering both is a measured
+        # race: SecurityAgent picks the
+        # persistent one, because pairing keys on the certificate hash rather
+        # than the token, and the lock screen answers "smartcard initialization
+        # error" on submit with no way in but the Mac's own Touch ID.
+        # `--persistent` registers it on purpose; nothing else may.
+        echo "installed. Token drivers macOS now knows:"
+        pluginkit -m -p com.apple.ctk-tokens -v
+        ;;
+    *)         exec "$BINARY" ;;
+esac
