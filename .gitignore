@@ -1,0 +1,22 @@
+.DS_Store
+.output.txt
+.pio/
+.idea/
+managed_components/
+sdkconfig
+sdkconfig.deskid
+sdkconfig.deskid-bringup
+sdkconfig.deskid-production
+sdkconfig.old
+__pycache__/
+
+# Provisioning outputs and private credentials
+credentials.bin
+nvs_keys.bin
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+# Built setup app
+dist/

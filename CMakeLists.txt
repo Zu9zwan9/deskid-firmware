@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.16.0)
+set(PROJECT_VER "0.1.0")
+set(SDKCONFIG_DEFAULTS "sdkconfig.defaults")
+if("$ENV{PIOENV}" STREQUAL "deskid-production")
+    list(APPEND SDKCONFIG_DEFAULTS "sdkconfig.production.defaults")
+endif()
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(DeskID)
