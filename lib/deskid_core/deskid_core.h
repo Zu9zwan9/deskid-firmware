@@ -28,6 +28,13 @@ public:
 /// a host which selects often cannot turn it into a permanent load.
 constexpr uint8_t kArmOnSelectSeconds = 20;
 
+/// How long a VERIFY that was answered by a fingerprint keeps the next
+/// signature unlocked. The same window a request waits for a finger and an
+/// early touch stays spendable, so there is one number to explain. Without a
+/// bound a card left selected holds a signature in reserve for whichever
+/// process asks first, hours later.
+constexpr uint64_t kVerifiedValidMilliseconds = 30000;
+
 struct DeviceStatus {
     const char *firmwareVersion = "";
     uint8_t buildVariant = 0;
@@ -40,6 +47,12 @@ struct DeviceStatus {
     uint8_t consecutiveFailures = 0;
     uint32_t lockoutSecondsRemaining = 0;
     uint32_t enrolledTemplates = 0;
+    // Whether the sensor has actually reported that count. An empty library
+    // opens enrollment to anyone, so "zero" has to be an answer and never the
+    // value the counter started at: a sensor that failed to answer at boot
+    // must not read as a sensor with nothing enrolled. Not part of the status
+    // object.
+    bool templateCountKnown = false;
     bool wakeLineHigh = false;
     // Finger first seen to match confirmed, for the most recent successful
     // authentication. Zero until one has happened since boot.
@@ -65,6 +78,9 @@ public:
     virtual ~DeviceDiagnostics() = default;
 
     virtual DeviceStatus status() const = 0;
+    /// Monotonic time since boot. The applet has no clock of its own and
+    /// needs one to let a verified touch expire.
+    virtual uint64_t uptimeMilliseconds() const = 0;
     virtual bool enterDownloadMode() = 0;
     virtual bool enrollStep(uint8_t &stage) = 0;
     virtual bool forgetFingerprints() = 0;
@@ -94,6 +110,7 @@ private:
     void drainPending(size_t requestedLength, uint8_t *response,
                       size_t responseCapacity, size_t &responseLength);
     bool provisioned() const;
+    bool verificationHeld();
 
     PivCredential &credential_;
     DeviceDiagnostics &diagnostics_;
@@ -102,6 +119,7 @@ private:
     size_t pendingLength_ = 0;
     bool selected_ = false;
     bool verified_ = false;
+    uint64_t verifiedAtMilliseconds_ = 0;
 };
 
 class RateLimiter {
@@ -127,6 +145,41 @@ private:
     uint32_t consecutiveFailures_ = 0;
     uint32_t lockoutCount_ = 0;
     uint64_t lockedUntilMilliseconds_ = 0;
+};
+
+/// Where the limiter's counters outlive a power cycle.
+class LimiterStore {
+public:
+    virtual ~LimiterStore() = default;
+
+    virtual bool save(uint32_t consecutiveFailures, uint32_t lockoutCount) = 0;
+};
+
+// Charges a match attempt before the sensor is asked for its verdict.
+//
+// The verdict is the secret. Counting a failure after hearing it leaves a gap
+// between the answer and the write, and pulling the plug inside it erases the
+// attempt. Five tries then become as many as the attacker has patience for. Smart cards close that gap by spending the try
+// first and refunding it on success, and so does this: charge() counts the
+// attempt as failed and writes that down, and only then may the sensor be
+// asked. matched() is the refund.
+//
+// An attempt that cannot be written down is refused. A limiter that only
+// exists in memory is the bug this class is here to remove.
+class AttemptLedger {
+public:
+    AttemptLedger(RateLimiter &limiter, LimiterStore &store);
+
+    /// Call immediately before asking the sensor for a verdict. False means
+    /// the sensor must not be asked: locked out, or the charge did not reach
+    /// storage.
+    bool charge(uint64_t nowMilliseconds);
+    /// The verdict was a match. Clears the counters and persists that.
+    void matched();
+
+private:
+    RateLimiter &limiter_;
+    LimiterStore &store_;
 };
 
 // A fingerprint match that happened before any host asked for one.
