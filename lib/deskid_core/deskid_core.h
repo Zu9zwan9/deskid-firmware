@@ -10,17 +10,30 @@ struct Bytes {
     size_t size;
 };
 
+/// The PIV key references this card serves. macOS asks for both when a card
+/// is used for login: 9A proves who is there, and 9D unwraps the keychain
+/// password and, on Apple silicon, the disk key.
+enum class Slot : uint8_t {
+    authentication = 0x9A,
+    keyManagement = 0x9D,
+};
+
 class PivCredential {
 public:
     virtual ~PivCredential() = default;
 
-    virtual Bytes certificateDer() const = 0;
+    virtual Bytes certificateDer(Slot slot) const = 0;
     virtual Bytes deviceIdentifier() const = 0;
     virtual bool signP256Sha256(Bytes digest, uint8_t *signature, size_t capacity,
                                size_t &signatureLength) = 0;
-    virtual bool generateKeyP256(uint8_t *publicKey, size_t capacity,
+    /// ECDH with the key management key. `peerPoint` is an uncompressed
+    /// P-256 point; the result is the shared X coordinate, 32 bytes. Must
+    /// refuse a point that is not on the curve.
+    virtual bool agreeP256(Bytes peerPoint, uint8_t *secret, size_t capacity,
+                           size_t &secretLength) = 0;
+    virtual bool generateKeyP256(Slot slot, uint8_t *publicKey, size_t capacity,
                                  size_t &publicKeyLength) = 0;
-    virtual bool storeCertificate(Bytes certificateDer) = 0;
+    virtual bool storeCertificate(Slot slot, Bytes certificateDer) = 0;
 };
 
 /// How long a fresh applet selection makes the board watch its own ring. Long
@@ -111,6 +124,7 @@ private:
                       size_t responseCapacity, size_t &responseLength);
     bool provisioned() const;
     bool verificationHeld();
+    void clearPending();
 
     PivCredential &credential_;
     DeviceDiagnostics &diagnostics_;

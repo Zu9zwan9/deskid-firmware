@@ -16,12 +16,25 @@ public:
             certificate_[index] = static_cast<uint8_t>(index);
         }
         certificateLength_ = certificate_.size();
+        for (size_t index = 0; index < keyManagementCertificate_.size();
+             ++index) {
+            keyManagementCertificate_[index] =
+                static_cast<uint8_t>(0xA0 ^ index);
+        }
+        keyManagementCertificateLength_ = keyManagementCertificate_.size();
         generatedKeys = 0;
+        generatedKeyManagementKeys = 0;
+        agreements = 0;
     }
 
     void forget() { certificateLength_ = 0; }
+    void forgetKeyManagement() { keyManagementCertificateLength_ = 0; }
 
-    deskid::Bytes certificateDer() const override {
+    deskid::Bytes certificateDer(deskid::Slot slot) const override {
+        if (slot == deskid::Slot::keyManagement) {
+            return {keyManagementCertificate_.data(),
+                    keyManagementCertificateLength_};
+        }
         return {certificate_.data(), certificateLength_};
     }
 
@@ -44,8 +57,25 @@ public:
         return true;
     }
 
-    bool generateKeyP256(uint8_t *publicKey, size_t capacity,
-                         size_t &publicKeyLength) override {
+    // Stands in for ECDH: the "secret" is the peer's X coordinate with every
+    // byte flipped, so a test can tell it came from the point it sent.
+    bool agreeP256(deskid::Bytes peerPoint, uint8_t *secret, size_t capacity,
+                   size_t &secretLength) override {
+        secretLength = 0;
+        if (peerPoint.size != 65 || peerPoint.data[0] != 0x04 ||
+            capacity < 32) {
+            return false;
+        }
+        for (size_t index = 0; index < 32; ++index) {
+            secret[index] = static_cast<uint8_t>(~peerPoint.data[1 + index]);
+        }
+        secretLength = 32;
+        ++agreements;
+        return true;
+    }
+
+    bool generateKeyP256(deskid::Slot slot, uint8_t *publicKey,
+                         size_t capacity, size_t &publicKeyLength) override {
         publicKeyLength = 0;
         if (capacity < 65) {
             return false;
@@ -55,27 +85,34 @@ public:
             publicKey[index] = static_cast<uint8_t>(index);
         }
         publicKeyLength = 65;
-        ++generatedKeys;
+        ++(slot == deskid::Slot::keyManagement ? generatedKeyManagementKeys
+                                               : generatedKeys);
         return true;
     }
 
-    bool storeCertificate(deskid::Bytes certificateDer) override {
-        if (certificateDer.size == 0 ||
-            certificateDer.size > certificate_.size()) {
+    bool storeCertificate(deskid::Slot slot,
+                          deskid::Bytes certificateDer) override {
+        const bool keyManagement = slot == deskid::Slot::keyManagement;
+        auto &storage = keyManagement ? keyManagementCertificate_ : certificate_;
+        if (certificateDer.size == 0 || certificateDer.size > storage.size()) {
             return false;
         }
-        std::memcpy(certificate_.data(), certificateDer.data,
-                    certificateDer.size);
-        certificateLength_ = certificateDer.size;
+        std::memcpy(storage.data(), certificateDer.data, certificateDer.size);
+        (keyManagement ? keyManagementCertificateLength_ : certificateLength_) =
+            certificateDer.size;
         return true;
     }
 
     size_t generatedKeys = 0;
+    size_t generatedKeyManagementKeys = 0;
+    size_t agreements = 0;
 
 private:
     std::array<uint8_t, 300> certificate_{};
+    std::array<uint8_t, 300> keyManagementCertificate_{};
     std::array<uint8_t, 16> identifier_{};
     size_t certificateLength_ = 0;
+    size_t keyManagementCertificateLength_ = 0;
 };
 
 class FakeDiagnostics final : public deskid::DeviceDiagnostics {
@@ -989,6 +1026,189 @@ void test_status_object_fits_the_longest_version_string() {
     TEST_ASSERT_EQUAL_HEX8(0x90, response[responseLength - 2]);
 }
 
+// ---- slot 9D, key management ----------------------------------------------
+
+// GENERAL AUTHENTICATE for slot 9D: 7C { 82 00, 85 41 <uncompressed point> }.
+std::array<uint8_t, 76> keyAgreementRequest() {
+    std::array<uint8_t, 76> request = {
+        0x00, 0x87, 0x11, 0x9D, 0x47, 0x7C, 0x45,
+        0x82, 0x00, 0x85, 0x41, 0x04,
+    };
+    for (size_t index = 12; index < request.size(); ++index) {
+        request[index] = static_cast<uint8_t>(index);
+    }
+    return request;
+}
+
+void test_key_agreement_waits_for_a_fingerprint_and_returns_the_secret() {
+    selectApplet();
+    const auto request = keyAgreementRequest();
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(request.data(), request.size(), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(0, credential.agreements);
+
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(request.data(), request.size(), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(1, credential.agreements);
+    TEST_ASSERT_EQUAL_UINT32(4 + 32 + 2, responseLength);
+    constexpr uint8_t header[] = {0x7C, 0x22, 0x82, 0x20};
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(header, response.data(), sizeof(header));
+    for (size_t index = 0; index < 32; ++index) {
+        TEST_ASSERT_EQUAL_HEX8(static_cast<uint8_t>(~request[12 + index]),
+                               response[4 + index]);
+    }
+    TEST_ASSERT_EQUAL_HEX8(0x90, response[36]);
+    TEST_ASSERT_EQUAL_HEX8(0x00, response[37]);
+}
+
+// One verified touch is one private-key operation, whichever slot spends it.
+void test_key_agreement_spends_a_verified_touch_exactly_once() {
+    selectApplet();
+    constexpr uint8_t verify[] = {
+        0x00, 0x20, 0x00, 0x80, 0x08, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+    const auto request = keyAgreementRequest();
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(verify, sizeof(verify), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(request.data(), request.size(), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_HEX8(0x7C, response[0]);
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(request.data(), request.size(), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+}
+
+void test_key_agreement_rejects_malformed_templates_without_waiting() {
+    selectApplet();
+    size_t responseLength = 0;
+    auto expectWrongData = [&](const uint8_t *apdu, size_t length) {
+        TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                          applet.transceive(apdu, length, false,
+                                            response.data(), response.size(),
+                                            responseLength));
+        TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+        TEST_ASSERT_EQUAL_HEX16(0x6A80, static_cast<uint16_t>(
+                                            response[0] << 8 | response[1]));
+    };
+
+    // A point one byte short.
+    std::array<uint8_t, 75> shortPoint = {
+        0x00, 0x87, 0x11, 0x9D, 0x46, 0x7C, 0x44,
+        0x82, 0x00, 0x85, 0x40, 0x04,
+    };
+    expectWrongData(shortPoint.data(), shortPoint.size());
+
+    // No response placeholder.
+    std::array<uint8_t, 74> noPlaceholder = {
+        0x00, 0x87, 0x11, 0x9D, 0x45, 0x7C, 0x43, 0x85, 0x41, 0x04,
+    };
+    expectWrongData(noPlaceholder.data(), noPlaceholder.size());
+
+    // A signing template sent to the key management slot.
+    std::array<uint8_t, 43> digestTemplate = {
+        0x00, 0x87, 0x11, 0x9D, 0x26, 0x7C, 0x24, 0x82, 0x00, 0x81, 0x20,
+    };
+    expectWrongData(digestTemplate.data(), digestTemplate.size());
+
+    // A compressed point: the credential refuses it after the gate.
+    auto compressed = keyAgreementRequest();
+    compressed[11] = 0x02;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(compressed.data(), compressed.size(),
+                                        true, response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_HEX16(0x6A80, static_cast<uint16_t>(response[0] << 8 |
+                                                          response[1]));
+    TEST_ASSERT_EQUAL_UINT32(0, credential.agreements);
+}
+
+void test_key_agreement_is_refused_without_a_key_management_identity() {
+    credential.forgetKeyManagement();
+    selectApplet();
+    const auto request = keyAgreementRequest();
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(request.data(), request.size(), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+    TEST_ASSERT_EQUAL_HEX16(0x6A88, static_cast<uint16_t>(response[0] << 8 |
+                                                          response[1]));
+}
+
+void test_key_management_slot_generates_its_own_key_behind_the_gate() {
+    selectApplet();
+    constexpr uint8_t generate[] = {0x00, 0x47, 0x00, 0x9D, 0x05,
+                                    0xAC, 0x03, 0x80, 0x01, 0x11, 0x00};
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(generate, sizeof(generate), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(generate, sizeof(generate), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(1, credential.generatedKeyManagementKeys);
+    TEST_ASSERT_EQUAL_UINT32(0, credential.generatedKeys);
+    TEST_ASSERT_EQUAL_UINT32(72, responseLength);
+    constexpr uint8_t header[] = {0x7F, 0x49, 0x43, 0x86, 0x41, 0x04};
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(header, response.data(), sizeof(header));
+}
+
+void test_key_management_certificate_has_its_own_object() {
+    selectApplet();
+    constexpr uint8_t putCertificate[] = {
+        0x00, 0xDB, 0x3F, 0xFF, 0x14, 0x5C, 0x03, 0x5F, 0xC1,
+        0x0B, 0x53, 0x0D, 0x70, 0x06, 0xB1, 0xB2, 0xB3, 0xB4,
+        0xB5, 0xB6, 0x71, 0x01, 0x00, 0xFE, 0x00,
+    };
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(putCertificate, sizeof(putCertificate),
+                                        false, response.data(),
+                                        response.size(), responseLength));
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(putCertificate, sizeof(putCertificate),
+                                        true, response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_HEX16(0x9000, static_cast<uint16_t>(response[0] << 8 |
+                                                          response[1]));
+
+    constexpr uint8_t getKeyManagement[] = {
+        0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x0B, 0x00,
+    };
+    applet.transceive(getKeyManagement, sizeof(getKeyManagement), false,
+                      response.data(), response.size(), responseLength);
+    constexpr uint8_t expected[] = {0x53, 0x0D, 0x70, 0x06, 0xB1, 0xB2,
+                                    0xB3, 0xB4, 0xB5, 0xB6, 0x71, 0x01,
+                                    0x00, 0xFE, 0x00, 0x90, 0x00};
+    TEST_ASSERT_EQUAL_UINT32(sizeof(expected), responseLength);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, response.data(),
+                                  sizeof(expected));
+
+    // The authentication certificate is a different object and is untouched.
+    constexpr uint8_t getAuthentication[] = {
+        0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x05, 0x00,
+    };
+    applet.transceive(getAuthentication, sizeof(getAuthentication), false,
+                      response.data(), response.size(), responseLength);
+    TEST_ASSERT_EQUAL_HEX8(0x53, response[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x82, response[1]);
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_selects_standard_piv_aid);
@@ -1027,5 +1247,11 @@ int main(int, char **) {
     RUN_TEST(test_enrollment_is_gated_while_the_template_count_is_unknown);
     RUN_TEST(test_verify_expires_instead_of_waiting_for_a_signature);
     RUN_TEST(test_status_object_fits_the_longest_version_string);
+    RUN_TEST(test_key_agreement_waits_for_a_fingerprint_and_returns_the_secret);
+    RUN_TEST(test_key_agreement_spends_a_verified_touch_exactly_once);
+    RUN_TEST(test_key_agreement_rejects_malformed_templates_without_waiting);
+    RUN_TEST(test_key_agreement_is_refused_without_a_key_management_identity);
+    RUN_TEST(test_key_management_slot_generates_its_own_key_behind_the_gate);
+    RUN_TEST(test_key_management_certificate_has_its_own_object);
     return UNITY_END();
 }

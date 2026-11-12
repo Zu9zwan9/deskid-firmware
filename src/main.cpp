@@ -105,6 +105,7 @@ constexpr uint64_t kFingerprintMaximumLockoutMilliseconds = 900000;
 constexpr char kStorageNamespace[] = "deskid";
 constexpr char kCertificateKey[] = "piv_cert";
 constexpr char kPrivateKeyKey[] = "piv_key";
+constexpr char kKeyManagementKey[] = "piv_km";
 constexpr char kSensorPasswordKey[] = "finger_pwd";
 constexpr char kSensorReadyKey[] = "finger_ready";
 constexpr char kFailureCountKey[] = "finger_fail";
@@ -320,6 +321,12 @@ public:
         if (pendingKeyId_ != PSA_KEY_ID_NULL) {
             psa_destroy_key(pendingKeyId_);
         }
+        if (kmKeyId_ != PSA_KEY_ID_NULL) {
+            psa_destroy_key(kmKeyId_);
+        }
+        if (kmPendingKeyId_ != PSA_KEY_ID_NULL) {
+            psa_destroy_key(kmPendingKeyId_);
+        }
         secureZero(privateKeyDer_.data(), privateKeyDer_.size());
     }
 
@@ -335,12 +342,16 @@ public:
         const esp_err_t result = loadSensorPassword(handle);
         if (result == ESP_OK) {
             loadCredential(handle);
+            loadKeyManagement(handle);
         }
         nvs_close(handle);
         return result;
     }
 
-    deskid::Bytes certificateDer() const override {
+    deskid::Bytes certificateDer(deskid::Slot slot) const override {
+        if (slot == deskid::Slot::keyManagement) {
+            return {kmBlob_.data() + kScalarLength, kmCertificateLength_};
+        }
         return {certificate_.data(), certificateLength_};
     }
 
@@ -387,15 +398,17 @@ public:
         return true;
     }
 
-    bool generateKeyP256(uint8_t *publicKey, size_t capacity,
-                         size_t &publicKeyLength) override {
+    bool generateKeyP256(deskid::Slot slot, uint8_t *publicKey,
+                         size_t capacity, size_t &publicKeyLength) override {
+        const bool keyManagement = slot == deskid::Slot::keyManagement;
+        psa_key_id_t &pending = keyManagement ? kmPendingKeyId_ : pendingKeyId_;
         publicKeyLength = 0;
         if (publicKey == nullptr || capacity < 65) {
             return false;
         }
-        if (pendingKeyId_ != PSA_KEY_ID_NULL) {
-            psa_destroy_key(pendingKeyId_);
-            pendingKeyId_ = PSA_KEY_ID_NULL;
+        if (pending != PSA_KEY_ID_NULL) {
+            psa_destroy_key(pending);
+            pending = PSA_KEY_ID_NULL;
         }
 
         psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
@@ -404,23 +417,27 @@ public:
             PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
         psa_set_key_bits(&attributes, 256);
         psa_set_key_usage_flags(
-            &attributes, PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_EXPORT);
-        psa_set_key_algorithm(&attributes, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+            &attributes,
+            (keyManagement ? PSA_KEY_USAGE_DERIVE : PSA_KEY_USAGE_SIGN_HASH) |
+                PSA_KEY_USAGE_EXPORT);
+        psa_set_key_algorithm(&attributes,
+                              keyManagement ? PSA_ALG_ECDH
+                                            : PSA_ALG_ECDSA(PSA_ALG_SHA_256));
         const EntropySource entropy;
         const psa_status_t generateStatus =
-            psa_generate_key(&attributes, &pendingKeyId_);
+            psa_generate_key(&attributes, &pending);
         psa_reset_key_attributes(&attributes);
         if (generateStatus != PSA_SUCCESS) {
-            pendingKeyId_ = PSA_KEY_ID_NULL;
+            pending = PSA_KEY_ID_NULL;
             return false;
         }
 
         size_t exportedLength = 0;
-        if (psa_export_public_key(pendingKeyId_, publicKey, capacity,
+        if (psa_export_public_key(pending, publicKey, capacity,
                                   &exportedLength) != PSA_SUCCESS ||
             exportedLength != 65) {
-            psa_destroy_key(pendingKeyId_);
-            pendingKeyId_ = PSA_KEY_ID_NULL;
+            psa_destroy_key(pending);
+            pending = PSA_KEY_ID_NULL;
             return false;
         }
         publicKeyLength = exportedLength;
@@ -430,7 +447,11 @@ public:
     // A generated key stays volatile until the matching certificate arrives.
     // Persisting it earlier would leave a key that no stored certificate
     // matches, and initialize() refuses to boot that pair.
-    bool storeCertificate(deskid::Bytes certificateDer) override {
+    bool storeCertificate(deskid::Slot slot,
+                          deskid::Bytes certificateDer) override {
+        if (slot == deskid::Slot::keyManagement) {
+            return storeKeyManagementCertificate(certificateDer);
+        }
         if (certificateDer.data == nullptr || certificateDer.size == 0 ||
             certificateDer.size > certificate_.size()) {
             return false;
@@ -487,6 +508,29 @@ public:
                     certificateDer.size);
         certificateLength_ = certificateDer.size;
         return refreshIdentifier() == ESP_OK;
+    }
+
+    // ECDH with the slot 9D key. PSA rejects a peer point that is not on the
+    // curve before it computes anything.
+    bool agreeP256(deskid::Bytes peerPoint, uint8_t *secret, size_t capacity,
+                   size_t &secretLength) override {
+        secretLength = 0;
+        if (peerPoint.data == nullptr || peerPoint.size != 65 ||
+            secret == nullptr || capacity < kScalarLength ||
+            kmKeyId_ == PSA_KEY_ID_NULL) {
+            return false;
+        }
+        size_t length = 0;
+        const EntropySource entropy;
+        if (psa_raw_key_agreement(PSA_ALG_ECDH, kmKeyId_, peerPoint.data,
+                                  peerPoint.size, secret, capacity,
+                                  &length) != PSA_SUCCESS ||
+            length != kScalarLength) {
+            secureZero(secret, capacity);
+            return false;
+        }
+        secretLength = length;
+        return true;
     }
 
     uint32_t sensorPassword() const { return sensorPassword_; }
@@ -591,6 +635,109 @@ private:
         }
     }
 
+    // Slot 9D is one NVS blob, scalar then certificate, so a pulled plug
+    // cannot leave a key beside a certificate that does not match it. The
+    // scalar is in kmBlob_ only while the blob is being read or written.
+    void loadKeyManagement(nvs_handle_t handle) {
+        if (kmKeyId_ != PSA_KEY_ID_NULL) {
+            psa_destroy_key(kmKeyId_);
+            kmKeyId_ = PSA_KEY_ID_NULL;
+        }
+        kmCertificateLength_ = 0;
+
+        size_t length = kmBlob_.size();
+        psa_status_t importStatus = PSA_ERROR_DOES_NOT_EXIST;
+        if (nvs_get_blob(handle, kKeyManagementKey, kmBlob_.data(),
+                         &length) == ESP_OK &&
+            length > kScalarLength) {
+            psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+            psa_set_key_type(
+                &attributes,
+                PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+            psa_set_key_bits(&attributes, 256);
+            psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE);
+            psa_set_key_algorithm(&attributes, PSA_ALG_ECDH);
+            importStatus = psa_import_key(&attributes, kmBlob_.data(),
+                                          kScalarLength, &kmKeyId_);
+            psa_reset_key_attributes(&attributes);
+        }
+        secureZero(kmBlob_.data(), kScalarLength);
+        if (importStatus != PSA_SUCCESS) {
+            kmKeyId_ = PSA_KEY_ID_NULL;
+            return;
+        }
+
+        uint8_t certificatePublicKey[65];
+        if (!extractCertificatePublicKey(
+                {kmBlob_.data() + kScalarLength, length - kScalarLength},
+                certificatePublicKey) ||
+            !publicKeyMatches(kmKeyId_, certificatePublicKey)) {
+            psa_destroy_key(kmKeyId_);
+            kmKeyId_ = PSA_KEY_ID_NULL;
+            return;
+        }
+        kmCertificateLength_ = length - kScalarLength;
+    }
+
+    // Accepts a certificate for the key generated a moment ago, or a new
+    // certificate for the key already installed.
+    bool storeKeyManagementCertificate(deskid::Bytes certificateDer) {
+        if (certificateDer.data == nullptr || certificateDer.size == 0 ||
+            certificateDer.size > kmBlob_.size() - kScalarLength) {
+            return false;
+        }
+        uint8_t certificatePublicKey[65];
+        if (!extractCertificatePublicKey(certificateDer,
+                                         certificatePublicKey)) {
+            return false;
+        }
+        const bool adoptsPendingKey =
+            publicKeyMatches(kmPendingKeyId_, certificatePublicKey);
+        if (!adoptsPendingKey &&
+            !publicKeyMatches(kmKeyId_, certificatePublicKey)) {
+            return false;
+        }
+
+        nvs_handle_t handle;
+        if (nvs_open(kStorageNamespace, NVS_READWRITE, &handle) != ESP_OK) {
+            return false;
+        }
+        // The scalar comes from the pending key, or from the blob the
+        // installed key was loaded from: that key cannot be exported.
+        bool haveScalar = false;
+        if (adoptsPendingKey) {
+            size_t scalarLength = 0;
+            haveScalar = psa_export_key(kmPendingKeyId_, kmBlob_.data(),
+                                        kScalarLength,
+                                        &scalarLength) == PSA_SUCCESS &&
+                         scalarLength == kScalarLength;
+        } else {
+            size_t storedLength = kmBlob_.size();
+            haveScalar = nvs_get_blob(handle, kKeyManagementKey,
+                                      kmBlob_.data(),
+                                      &storedLength) == ESP_OK &&
+                         storedLength > kScalarLength;
+        }
+        bool stored = false;
+        if (haveScalar) {
+            std::memcpy(kmBlob_.data() + kScalarLength, certificateDer.data,
+                        certificateDer.size);
+            stored = nvs_set_blob(handle, kKeyManagementKey, kmBlob_.data(),
+                                  kScalarLength + certificateDer.size) ==
+                         ESP_OK &&
+                     nvs_commit(handle) == ESP_OK;
+        }
+        if (stored && adoptsPendingKey) {
+            psa_destroy_key(kmPendingKeyId_);
+            kmPendingKeyId_ = PSA_KEY_ID_NULL;
+        }
+        // Whatever happened, memory is brought back in line with flash. The
+        // key comes back without the right to be exported.
+        loadKeyManagement(handle);
+        nvs_close(handle);
+        return stored && kmCertificateLength_ == certificateDer.size;
+    }
+
     bool publicKeyMatches(psa_key_id_t keyId,
                           const uint8_t expected[65]) const {
         if (keyId == PSA_KEY_ID_NULL) {
@@ -626,6 +773,13 @@ private:
     size_t certificateLength_ = 0;
     psa_key_id_t keyId_ = PSA_KEY_ID_NULL;
     psa_key_id_t pendingKeyId_ = PSA_KEY_ID_NULL;
+    // Slot 9D: the scalar's 32 bytes, zero except during a read or write of
+    // the blob, then the certificate.
+    static constexpr size_t kScalarLength = 32;
+    std::array<uint8_t, kScalarLength + 1800> kmBlob_{};
+    size_t kmCertificateLength_ = 0;
+    psa_key_id_t kmKeyId_ = PSA_KEY_ID_NULL;
+    psa_key_id_t kmPendingKeyId_ = PSA_KEY_ID_NULL;
     uint32_t sensorPassword_ = 0;
     bool sensorProvisioned_ = false;
 };
@@ -1181,7 +1335,8 @@ public:
         value.freeHeapBytes = esp_get_free_heap_size();
         value.sensorState = sensor_.state();
         value.lastSensorConfirmation = sensor_.lastConfirmation();
-        value.credentialPresent = credential_.certificateDer().size != 0;
+        value.credentialPresent =
+            credential_.certificateDer(deskid::Slot::authentication).size != 0;
         value.consecutiveFailures = static_cast<uint8_t>(
             std::min<uint32_t>(limiter_.consecutiveFailures(), 0xFF));
         value.lockoutSecondsRemaining = static_cast<uint32_t>(
