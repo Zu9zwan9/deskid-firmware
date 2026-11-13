@@ -7,6 +7,13 @@
 // HMAC_DRBG behind this switch. It has to precede every mbedTLS header.
 #define MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS
 
+// Those headers lay their structures out by the mbedTLS configuration, and
+// this file must read the one the library was built with. platformio.ini
+// passes it. A build that loses it would compile, and corrupt its stack.
+#if !defined(MBEDTLS_CONFIG_FILE) || !defined(TF_PSA_CRYPTO_USER_CONFIG_FILE)
+#error "build_flags must pass ESP-IDF's mbedTLS configuration, see platformio.ini"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -26,9 +33,15 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+// With ESP-IDF's configuration mbedTLS includes <pthread.h>, and picolibc
+// declares pthread_exit with __noreturn after the declarator. In C++ that is
+// [[noreturn]] on a type, a warning this file's -Werror turns into an error.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattributes"
 #include "mbedtls/md.h"
 #include "mbedtls/private/ecdsa.h"
 #include "mbedtls/private/hmac_drbg.h"
+#pragma GCC diagnostic pop
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "psa/crypto.h"
