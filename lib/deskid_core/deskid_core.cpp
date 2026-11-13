@@ -1024,11 +1024,26 @@ void EarlyTouch::clear() { expiresAtMilliseconds_ = 0; }
 
 uint32_t EarlyTouch::gates() const { return gates_; }
 
-void Autotype::arm(uint8_t seconds, uint64_t nowMilliseconds) {
+bool Autotype::arm(uint8_t seconds, uint64_t nowMilliseconds, bool toWake) {
     const uint64_t capped =
         seconds < kMaximumAutotypeSeconds ? seconds : kMaximumAutotypeSeconds;
-    armedUntilMilliseconds_ =
-        capped == 0 ? 0 : nowMilliseconds + capped * 1000;
+    const bool woken = nowMilliseconds < wokenUntilMilliseconds_;
+    if (capped == 0) {
+        armedUntilMilliseconds_ = 0;
+        wokenUntilMilliseconds_ = 0;
+        return false;
+    }
+    if (woken && !toWake) {
+        // The match that woke the display is the one this arming is for, so
+        // the arming is spent on it and leaves nothing behind.
+        armedUntilMilliseconds_ = 0;
+        wokenUntilMilliseconds_ = 0;
+        ++emissions_;
+        return true;
+    }
+    armedUntilMilliseconds_ = nowMilliseconds + capped * 1000;
+    toWake_ = toWake;
+    return false;
 }
 
 uint8_t Autotype::secondsRemaining(uint64_t nowMilliseconds) const {
@@ -1044,11 +1059,23 @@ bool Autotype::take(uint64_t nowMilliseconds) {
         return false;
     }
     armedUntilMilliseconds_ = 0;
-    ++emissions_;
+    if (toWake_) {
+        // Nothing is typed yet, so nothing is counted yet.
+        wokenUntilMilliseconds_ = nowMilliseconds + kWokenMatchMilliseconds;
+    } else {
+        ++emissions_;
+    }
     return true;
 }
 
+bool Autotype::wakes() const { return toWake_; }
+
 uint32_t Autotype::emissions() const { return emissions_; }
+
+void Autotype::wakeReport(bool pressed, uint8_t report[8]) {
+    std::memset(report, 0, 8);
+    report[0] = pressed ? 0x02 : 0x00;  // Left Shift
+}
 
 void Autotype::report(size_t index, uint8_t report[8]) {
     // Keypad 1 to Keypad 6, then Return. HID sends key positions, and the top
