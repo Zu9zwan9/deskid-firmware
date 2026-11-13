@@ -42,6 +42,11 @@ bool takeAutotypeArm(uint8_t &seconds, bool &toWake);
 /// board armed for as long as it likes, because watching costs no captures.
 void publishAutotypeStatus(uint8_t secondsRemaining, uint32_t emissions,
                            bool watchesForFree);
+/// True while the host has suspended the bus: the Mac is asleep.
+bool hostAsleep();
+/// Asks a sleeping host to wake, the way a key press on a sleeping keyboard
+/// does. False when the host is awake or did not let this device wake it.
+bool wakeHost();
 /// Sends one eight-byte keyboard report. False when the host is not taking
 /// them: suspended, not configured, or the interface refused.
 bool sendKeyboardReport(const uint8_t report[8]);

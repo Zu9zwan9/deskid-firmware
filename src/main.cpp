@@ -1576,8 +1576,16 @@ deskid::Autotype g_autotype;
     deskid::sendKeyboardReport(report);
 }
 
-// One press and release of the wake key, for a display that is asleep.
-[[maybe_unused]] void tapWakeKey() {
+// Wakes the Mac: its display, and the Mac itself when the bus is suspended.
+[[maybe_unused]] void wakeMac() {
+    // A sleeping Mac takes no key reports. It is woken the way a key press
+    // on a sleeping keyboard wakes it, and the tap that follows is the user
+    // activity that lights the display.
+    if (deskid::wakeHost()) {
+        for (int wait = 0; wait < 100 && deskid::hostAsleep(); ++wait) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
     uint8_t report[8];
     deskid::Autotype::wakeReport(true, report);
     if (deskid::sendKeyboardReport(report)) {
@@ -1841,10 +1849,16 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
             if (g_autotype.take(millisecondsSinceBoot())) {
                 if (g_autotype.wakes()) {
                     // The digits follow when the host says the screen is lit.
-                    tapWakeKey();
+                    wakeMac();
                 } else {
                     typeDummyPin();
                 }
+            } else if (deskid::hostAsleep()) {
+                // No helper runs on a Mac that is asleep, so nothing armed
+                // the board. A match still wakes it, and is held for the
+                // arming that follows once the lock screen is lit.
+                wakeMac();
+                g_autotype.wokeHost(millisecondsSinceBoot());
             }
             // The look ends itself; a lifting finger must not cut it short.
             g_idleRingLit = false;

@@ -1135,6 +1135,10 @@ bool Autotype::take(uint64_t nowMilliseconds) {
 
 bool Autotype::wakes() const { return toWake_; }
 
+void Autotype::wokeHost(uint64_t nowMilliseconds) {
+    wokenUntilMilliseconds_ = nowMilliseconds + kWokenMatchMilliseconds;
+}
+
 uint32_t Autotype::emissions() const { return emissions_; }
 
 void Autotype::wakeReport(bool pressed, uint8_t report[8]) {
