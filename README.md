@@ -295,6 +295,8 @@ Each key is down for 30 ms and up for 30 ms (`kAutotypeReportMilliseconds`), abo
 
 Keys sent into a dark lock screen are lost. Armed with `02`, a match taps Left Shift and types nothing. The display wakes, the host sees a lit screen that is still locked and arms with `01`, and that arming types the digits 400 ms later (`kAutotypeLitMilliseconds`). The match waits 10 s for it (`kWokenMatchMilliseconds`). Zero seconds drops the match, so a Mac that something else unlocked in between gets no digits.
 
+macOS drops keys while a display comes up and reports nothing. Measured on 2026-11-13 on macOS 27.0.1 with an external monitor: the wake tap lit the display, digits typed 0.6 s to 1.0 s after it were lost, and the display took keys 2.0 s after the tap. So the digits are typed again every 2.2 s (`kRetypeMilliseconds`), at most twice (`kMaximumRetypes`), until the host asks the card for a private-key operation, which only a submitted PIN field causes.
+
 A Mac that is fully asleep suspends the bus and runs no helper, so nothing arms the board. A match then signals remote wakeup, taps Left Shift once the bus resumes, and is held for the `01` arming the same way. The configuration descriptor sets the remote wakeup bit for this. A board whose wake line is not trusted does not watch its ring while the Mac sleeps and cannot wake it.
 
 What to expect from macOS:
