@@ -23,6 +23,15 @@ constexpr uint8_t kSelectResponse[] = {
     0x79, 0x07, 0x4F, 0x05, 0xA0, 0x00, 0x00, 0x03, 0x08,
 };
 
+// Responses can carry a shared secret, so buffers that held one are cleared
+// in a way the optimiser cannot remove.
+void wipe(void *data, size_t length) {
+    volatile uint8_t *cursor = static_cast<volatile uint8_t *>(data);
+    while (length-- != 0) {
+        *cursor++ = 0;
+    }
+}
+
 struct Apdu {
     uint8_t cla = 0;
     uint8_t instruction = 0;
@@ -303,14 +312,54 @@ bool parseAuthenticationTemplate(Bytes data, Bytes &digest) {
     return responseRequestSeen && digestSeen && digest.size == 32;
 }
 
+// GENERAL AUTHENTICATE for the key management key: 7C { 82 00, 85 <point> },
+// where the point is the other party's uncompressed P-256 public key.
+bool parseKeyAgreementTemplate(Bytes data, Bytes &peerPoint) {
+    if (data.size < 2 || data.data[0] != 0x7C) {
+        return false;
+    }
+    size_t offset = 1;
+    size_t outerLength = 0;
+    if (!decodeLength(data, offset, outerLength) ||
+        offset + outerLength != data.size) {
+        return false;
+    }
+
+    const size_t end = offset + outerLength;
+    bool responseRequestSeen = false;
+    bool pointSeen = false;
+    while (offset < end) {
+        const uint8_t tag = data.data[offset++];
+        size_t length = 0;
+        if (!decodeLength(data, offset, length) || length > end - offset) {
+            return false;
+        }
+        if (tag == 0x82 && length == 0) {
+            responseRequestSeen = true;
+        } else if (tag == 0x85 && !pointSeen) {
+            peerPoint = {data.data + offset, length};
+            pointSeen = true;
+        } else {
+            return false;
+        }
+        offset += length;
+    }
+    return responseRequestSeen && pointSeen && peerPoint.size == 65;
+}
+
 }  // namespace
 
 PivApplet::PivApplet(PivCredential &credential, DeviceDiagnostics &diagnostics)
     : credential_(credential), diagnostics_(diagnostics) {}
 
-void PivApplet::reset() {
+void PivApplet::clearPending() {
+    wipe(pendingResponse_, pendingLength_);
     pendingOffset_ = 0;
     pendingLength_ = 0;
+}
+
+void PivApplet::reset() {
+    clearPending();
     selected_ = false;
     verified_ = false;
     verifiedAtMilliseconds_ = 0;
@@ -326,8 +375,7 @@ void PivApplet::drainPending(size_t requestedLength, uint8_t *response,
     pendingOffset_ += chunkLength;
     const size_t afterChunk = pendingLength_ - pendingOffset_;
     if (afterChunk == 0) {
-        pendingOffset_ = 0;
-        pendingLength_ = 0;
+        clearPending();
         response[chunkLength] = 0x90;
         response[chunkLength + 1] = 0x00;
     } else {
@@ -378,8 +426,7 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
         return TransceiveStatus::complete;
     }
 
-    pendingOffset_ = 0;
-    pendingLength_ = 0;
+    clearPending();
 
     if (apdu.instruction == 0xA4) {
         if ((apdu.cla & 0xEF) != 0x00 || apdu.parameter1 != 0x04 ||
@@ -422,6 +469,7 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
         constexpr uint8_t discoveryTag[] = {0x7E};
         constexpr uint8_t chuidTag[] = {0x5F, 0xC1, 0x02};
         constexpr uint8_t certificateTag[] = {0x5F, 0xC1, 0x05};
+        constexpr uint8_t keyManagementTag[] = {0x5F, 0xC1, 0x0B};
         constexpr uint8_t cccTag[] = {0x5F, 0xC1, 0x07};
         constexpr uint8_t statusTag[] = {0x5F, 0xFF, 0x01};
         if (requestedTag(apdu.data, discoveryTag, sizeof(discoveryTag))) {
@@ -495,8 +543,13 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
             return TransceiveStatus::complete;
         }
 
-        if (requestedTag(apdu.data, certificateTag, sizeof(certificateTag))) {
-            const Bytes certificate = credential_.certificateDer();
+        const bool keyManagementRequested = requestedTag(
+            apdu.data, keyManagementTag, sizeof(keyManagementTag));
+        if (keyManagementRequested ||
+            requestedTag(apdu.data, certificateTag, sizeof(certificateTag))) {
+            const Bytes certificate = credential_.certificateDer(
+                keyManagementRequested ? Slot::keyManagement
+                                       : Slot::authentication);
             if (certificate.data == nullptr || certificate.size == 0 ||
                 certificate.size > kMaximumResponseData - 16) {
                 status(0x6A82, response, responseCapacity, responseLength);
@@ -601,7 +654,7 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
 
     if (apdu.instruction == 0x47) {
         if (apdu.cla != 0x00 || apdu.parameter1 != 0x00 ||
-            apdu.parameter2 != 0x9A) {
+            (apdu.parameter2 != 0x9A && apdu.parameter2 != 0x9D)) {
             status(0x6A86, response, responseCapacity, responseLength);
             return TransceiveStatus::complete;
         }
@@ -618,7 +671,8 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
 
         uint8_t publicKey[65];
         size_t publicKeyLength = 0;
-        if (!credential_.generateKeyP256(publicKey, sizeof(publicKey),
+        if (!credential_.generateKeyP256(static_cast<Slot>(apdu.parameter2),
+                                         publicKey, sizeof(publicKey),
                                          publicKeyLength) ||
             publicKeyLength != sizeof(publicKey) || publicKey[0] != 0x04) {
             status(0x6F00, response, responseCapacity, responseLength);
@@ -653,9 +707,15 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
             return TransceiveStatus::complete;
         }
         constexpr uint8_t certificateTag[] = {0x5F, 0xC1, 0x05};
-        if (tagList.size != sizeof(certificateTag) ||
-            std::memcmp(tagList.data, certificateTag,
-                        sizeof(certificateTag)) != 0) {
+        constexpr uint8_t keyManagementTag[] = {0x5F, 0xC1, 0x0B};
+        const bool keyManagementObject =
+            tagList.size == sizeof(keyManagementTag) &&
+            std::memcmp(tagList.data, keyManagementTag,
+                        sizeof(keyManagementTag)) == 0;
+        if (!keyManagementObject &&
+            (tagList.size != sizeof(certificateTag) ||
+             std::memcmp(tagList.data, certificateTag,
+                         sizeof(certificateTag)) != 0)) {
             status(0x6A82, response, responseCapacity, responseLength);
             return TransceiveStatus::complete;
         }
@@ -667,7 +727,10 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
         if (provisioned() && !userPresent) {
             return TransceiveStatus::userPresenceRequired;
         }
-        if (!credential_.storeCertificate(certificate)) {
+        if (!credential_.storeCertificate(keyManagementObject
+                                              ? Slot::keyManagement
+                                              : Slot::authentication,
+                                          certificate)) {
             status(0x6A84, response, responseCapacity, responseLength);
             return TransceiveStatus::complete;
         }
@@ -677,8 +740,43 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
 
     if (apdu.instruction == 0x87) {
         if (apdu.cla != 0x00 || apdu.parameter1 != 0x11 ||
-            apdu.parameter2 != 0x9A) {
+            (apdu.parameter2 != 0x9A && apdu.parameter2 != 0x9D)) {
             status(0x6A86, response, responseCapacity, responseLength);
+            return TransceiveStatus::complete;
+        }
+
+        // Slot 9D: ECDH. macOS uses it at login to unwrap the keychain
+        // password, so it sits behind the same gate as a signature, and one
+        // verified touch buys one private-key operation in either slot.
+        if (apdu.parameter2 == 0x9D) {
+            Bytes peerPoint{nullptr, 0};
+            if (!parseKeyAgreementTemplate(apdu.data, peerPoint)) {
+                status(0x6A80, response, responseCapacity, responseLength);
+                return TransceiveStatus::complete;
+            }
+            const Bytes keyManagement =
+                credential_.certificateDer(Slot::keyManagement);
+            if (keyManagement.data == nullptr || keyManagement.size == 0) {
+                status(0x6A88, response, responseCapacity, responseLength);
+                return TransceiveStatus::complete;
+            }
+            if (!verificationHeld() && !userPresent) {
+                return TransceiveStatus::userPresenceRequired;
+            }
+            // Spent here, whether or not the point turns out to be usable.
+            verified_ = false;
+
+            uint8_t encoded[4 + 32] = {0x7C, 0x22, 0x82, 0x20};
+            size_t secretLength = 0;
+            if (!credential_.agreeP256(peerPoint, encoded + 4, 32,
+                                       secretLength) ||
+                secretLength != 32) {
+                wipe(encoded, sizeof(encoded));
+                status(0x6A80, response, responseCapacity, responseLength);
+                return TransceiveStatus::complete;
+            }
+            sendData(encoded, sizeof(encoded), apdu.expectedLength);
+            wipe(encoded, sizeof(encoded));
             return TransceiveStatus::complete;
         }
 
@@ -811,7 +909,7 @@ bool PivApplet::verificationHeld() {
 }
 
 bool PivApplet::provisioned() const {
-    const Bytes certificate = credential_.certificateDer();
+    const Bytes certificate = credential_.certificateDer(Slot::authentication);
     return certificate.data != nullptr && certificate.size != 0;
 }
 

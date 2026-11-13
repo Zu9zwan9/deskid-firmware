@@ -38,8 +38,9 @@ volume and to unlock the user's Keychain", and a card without an encryption key
 "causes repeated keychain prompts"
 ([same page](https://support.apple.com/guide/deployment/depc47f60521/web),
 [SmartCardServices(7)](https://keith.github.io/xcode-man-pages/SmartCardServices.7.html)).
-DeskID implements slot 9A only. Slot 9D is standard PIV and the largest step
-toward parity.
+Slot 9D is standard PIV and the largest step toward parity. The firmware
+implements it (steps 1 to 3 below). The tools in steps 4 to 6 do not use it
+yet.
 
 Plan, test first:
 

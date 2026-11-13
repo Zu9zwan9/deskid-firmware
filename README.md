@@ -17,6 +17,7 @@ The clip shows a locked Mac unlocking on one touch, in real time, on the first h
 - Native ESP-IDF/TinyUSB CCID transport for the ESP32-S3 USB-OTG peripheral.
 - The mandatory CCID power, status, parameter, transfer, abort, clock and data-rate paths.
 - PIV application selection, Discovery, CCC, CHUID, certificate object `5FC105`, response chaining, `VERIFY`, and ECC P-256 `GENERAL AUTHENTICATE` for slot `9A`.
+- Slot `9D` key management in the firmware: its own key, certificate object `5FC10B`, and ECDH through `GENERAL AUTHENTICATE`, behind the same fingerprint gate. `tools/provision.py` and the token driver do not use it yet.
 - Host-driven authentication. macOS sends an APDU, CCID reports time extensions while the R503 waits, and a matching fingerprint releases the signature. The device sends no unsolicited APDU.
 - Touch first. The sensor is scanned between requests. A match is held for 30 s and can be spent once, by `VERIFY` or `GENERAL AUTHENTICATE`. See [Touch first](#touch-first).
 - Touch only, on development builds. A host arms the board, and after the next match the board types the PIN digits and Return itself over USB HID. See [Touch only](#touch-only).
