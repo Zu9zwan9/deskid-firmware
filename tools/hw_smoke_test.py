@@ -8,6 +8,7 @@ only in the native unit tests.
     python3 tools/hw_smoke_test.py
     python3 tools/hw_smoke_test.py --repeat 20
     python3 tools/hw_smoke_test.py --sign          # needs user presence
+    python3 tools/hw_smoke_test.py --nonce         # one digest signed twice, two touches
     python3 tools/hw_smoke_test.py --enroll        # guided fingerprint enrollment
 
 Standard library only: PCSC.framework through ctypes, openssl(1) for the
@@ -447,6 +448,34 @@ def run_sign(card: Card, report: Report) -> None:
     report.check("GENERAL AUTHENTICATE", False, f"SW {status:04X}")
 
 
+def run_nonce(card: Card, report: Report) -> None:
+    """Two signatures of one digest, which takes two touches.
+
+    The firmware hedges its nonce: fresh randomness goes in beside the key and
+    the digest. So the two signatures must differ. Plain RFC 6979 would return
+    the first one again, and a fault during one of two such signatures is how
+    that scheme loses a key.
+    """
+    card.send(SELECT_PIV)
+    digest = hashlib.sha256(os.urandom(32)).digest()
+    certificate_object, _, _ = get_data(card, TAG_CERTIFICATE)
+    certificate = certificate_from_object(certificate_object)
+    signatures = []
+    for attempt in ("first", "second"):
+        say(f"  ....  {attempt} signature of the same digest: touch the sensor")
+        emit("waiting", what=f"{attempt} signature", seconds=PRESENCE_TIMEOUT_SECONDS)
+        data, status, elapsed = card.send(general_authenticate(digest))
+        emit("signed", status=f"{status:04X}", seconds=round(elapsed, 1))
+        signature = read_tlv(read_tlv(data).get(0x7C, b"")).get(0x82) if status == SW_OK else None
+        if not report.check(f"{attempt} signature verifies against the device certificate",
+                            signature is not None
+                            and verify_signature(certificate, digest, signature),
+                            f"SW {status:04X} in {elapsed:.1f} s"):
+            return
+        signatures.append(signature)
+    report.check("two signatures of one digest differ", signatures[0] != signatures[1])
+
+
 def run_status(card: Card, report: Report) -> None:
     card.send(SELECT_PIV)
     data, status, _ = get_data(card, TAG_STATUS)
@@ -492,6 +521,11 @@ def run_status(card: Card, report: Report) -> None:
     report.note("wake line bias probe",
                 biases.get(number(0x13), f"0b{number(0x13):02b}")
                 if 0x13 in fields else "not reported by this firmware")
+    if 0x15 in fields:
+        report.check("signing self-test reproduced its known answer", number(0x15) == 1,
+                     "passed" if number(0x15) == 1 else "failed, the board refuses to sign")
+    else:
+        report.note("signing self-test", "not reported by this firmware")
     emit("status",
          firmware=fields.get(0x01, b"").decode(errors="replace"),
          variant=variant,
@@ -652,6 +686,8 @@ def main() -> int:
     parser.add_argument("--repeat", type=int, default=0, help="reliability loop iterations")
     parser.add_argument("--sign", action="store_true",
                         help="request a signature; needs a fingerprint match on sensor builds")
+    parser.add_argument("--nonce", action="store_true",
+                        help="sign one digest twice and require different signatures; two touches")
     parser.add_argument("--status", action="store_true",
                         help="read the diagnostic status object (5FFF01)")
     parser.add_argument("--enroll", action="store_true",
@@ -729,6 +765,14 @@ def main() -> int:
             card = Card(context, reader)
             try:
                 run_sign(card, report)
+            finally:
+                card.close()
+
+        if arguments.nonce:
+            say("\nnonce")
+            card = Card(context, reader)
+            try:
+                run_nonce(card, report)
             finally:
                 card.close()
 
