@@ -17,7 +17,7 @@ The clip shows a locked Mac unlocking on one touch, in real time, on the first h
 - Native ESP-IDF/TinyUSB CCID transport for the ESP32-S3 USB-OTG peripheral.
 - The mandatory CCID power, status, parameter, transfer, abort, clock and data-rate paths.
 - PIV application selection, Discovery, CCC, CHUID, certificate object `5FC105`, response chaining, `VERIFY`, and ECC P-256 `GENERAL AUTHENTICATE` for slot `9A`.
-- Slot `9D` key management in the firmware: its own key, certificate object `5FC10B`, and ECDH through `GENERAL AUTHENTICATE`, behind the same fingerprint gate. `tools/provision.py` and the token driver do not use it yet.
+- Slot `9D` key management in the firmware: its own key, certificate object `5FC10B`, and ECDH through `GENERAL AUTHENTICATE`, behind the same fingerprint gate. `tools/provision.py --key-management` adds the key and certificate to a provisioned board.
 - Host-driven authentication. macOS sends an APDU, CCID reports time extensions while the R503 waits, and a matching fingerprint releases the signature. The device sends no unsolicited APDU.
 - Touch first. The sensor is scanned between requests. A match is held for 30 s and can be spent once, by `VERIFY` or `GENERAL AUTHENTICATE`. See [Touch first](#touch-first).
 - Touch only, on development builds. A host arms the board, and after the next match the board types the PIN digits and Return itself over USB HID. See [Touch only](#touch-only).
@@ -167,6 +167,16 @@ The development image leaves a copy of the device key on the provisioning host. 
 ```
 
 The script sends `GENERATE ASYMMETRIC KEY PAIR` for slot `9A`, signs the returned P-256 point with the host CA, stores the certificate with `PUT DATA` and reads it back byte for byte. The board then signs a random challenge, and the script verifies that signature against the issued certificate. The script writes the certificate to disk and nothing else. The CA signing key stays on the host. The device key exists on the board alone.
+
+A board that has its identity gets the key management key the same way, without touching slot `9A`, so a paired Mac stays paired:
+
+```bash
+.pio/provisioning-venv/bin/python tools/provision.py --key-management \
+  --ca-certificate .pio/provisioning/deskid-ca.crt \
+  --ca-key .pio/provisioning/deskid-ca.key
+```
+
+The authority has to be the one that issued the identity certificate; the script checks that signature first. It then generates the key in slot `9D`, issues a certificate whose only key usage is key agreement, stores it as `5FC10B`, and agrees a key with a random peer to prove the private half is on the board. On a provisioned board each of the three steps waits for a fingerprint. macOS wraps the login keychain password to this key when the card is paired; without it macOS asks for that password at every smart card unlock.
 
 The board still needs an NVS image for the R503 password, so the development image remains the first step. All three APDUs are user-presence gated, so a sensor build waits for a fingerprint at each one.
 
