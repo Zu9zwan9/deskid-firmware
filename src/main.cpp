@@ -1492,7 +1492,8 @@ private:
     // Colour: 1 red, 2 blue, 3 purple on every unit; 4 green, 5 yellow,
     // 6 cyan and 7 white on units with a green LED. The numbers read as a
     // red, blue, green mask, so a unit without green is asked again for the
-    // same look less its green: white becomes purple, cyan blue, yellow red.
+    // same look less its green: white becomes purple and yellow red. Green
+    // alone would leave nothing, and becomes blue.
     struct RingLook {
         uint8_t control;
         uint8_t color;
@@ -1502,13 +1503,13 @@ private:
         {0x04, 0x02, 0},     // off
         {0x01, 0x07, 0},     // waiting: white, breathing
         {0x03, 0x02, 0},     // touched: blue
-        {0x03, 0x06, 700},   // success: cyan
+        {0x03, 0x04, 700},   // success: green
         {0x02, 0x01, 1300},  // failure: red, flashing
         {0x02, 0x05, 1300},  // adjust: yellow, flashing
         {0x01, 0x01, 0},     // lockedOut: red, breathing
         {0x01, 0x03, 0},     // enrollPlace: purple, breathing
         {0x03, 0x03, 0},     // enrollLift: purple
-        {0x02, 0x06, 1000},  // enrollStored: cyan, flashing
+        {0x02, 0x04, 1000},  // enrollStored: green, flashing
     };
 
     void setLed(uint8_t control, uint8_t color, uint8_t times) {
