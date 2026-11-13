@@ -100,6 +100,7 @@ public:
         value.touchValidSecondsRemaining = 11;
         value.wakeLineBias = 0b10;
         value.ringArmedSecondsRemaining = 42;
+        value.signingSelfTestPassed = signingSelfTestPassed;
         return value;
     }
 
@@ -141,6 +142,7 @@ public:
     bool templateCountKnown = true;
     uint64_t nowMilliseconds = 0;
     const char *firmwareVersion = "9.9.9";
+    bool signingSelfTestPassed = true;
 };
 
 // NVS as the limiter sees it: what was last written is all that survives a
@@ -197,6 +199,7 @@ void setUp() {
     diagnostics.templateCountKnown = true;
     diagnostics.nowMilliseconds = 0;
     diagnostics.firmwareVersion = "9.9.9";
+    diagnostics.signingSelfTestPassed = true;
     response.fill(0);
 }
 
@@ -612,7 +615,7 @@ void test_status_object_reports_device_state_without_user_presence() {
                                         response.data(), response.size(),
                                         responseLength));
     constexpr uint8_t expected[] = {
-        0x53, 0x57, 0x01, 0x05, 0x39, 0x2E, 0x39, 0x2E, 0x39, 0x02, 0x01,
+        0x53, 0x5A, 0x01, 0x05, 0x39, 0x2E, 0x39, 0x2E, 0x39, 0x02, 0x01,
         0x02, 0x03, 0x04, 0x00, 0x01, 0x02, 0x03, 0x04, 0x01, 0x04, 0x05,
         0x04, 0x00, 0x04, 0xAB, 0xCD, 0x06, 0x01, 0x01, 0x07, 0x01, 0x09,
         0x08, 0x01, 0x01, 0x09, 0x01, 0x03, 0x0A, 0x04, 0x00, 0x00, 0x00,
@@ -620,7 +623,7 @@ void test_status_object_reports_device_state_without_user_presence() {
         0x04, 0x00, 0x00, 0x04, 0xD2, 0x0E, 0x01, 0x00, 0x0F, 0x01, 0x00,
         0x10, 0x04, 0x00, 0x00, 0x00, 0x00, 0x11, 0x04, 0x00, 0x00, 0x00,
         0x07, 0x12, 0x01, 0x0B, 0x13, 0x01, 0x02, 0x14, 0x01, 0x2A,
-        0xFE, 0x00, 0x90, 0x00,
+        0x15, 0x01, 0x01, 0xFE, 0x00, 0x90, 0x00,
     };
     TEST_ASSERT_EQUAL_UINT32(sizeof(expected), responseLength);
     TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, response.data(), sizeof(expected));
@@ -983,10 +986,96 @@ void test_status_object_fits_the_longest_version_string() {
                       applet.transceive(getStatus, sizeof(getStatus), false,
                                         response.data(), response.size(),
                                         responseLength));
-    TEST_ASSERT_EQUAL_UINT32(2 + 82 + 16 + 2, responseLength);
+    TEST_ASSERT_EQUAL_UINT32(2 + 85 + 16 + 2, responseLength);
     TEST_ASSERT_EQUAL_HEX8(0x53, response[0]);
-    TEST_ASSERT_EQUAL_HEX8(82 + 16, response[1]);
+    TEST_ASSERT_EQUAL_HEX8(85 + 16, response[1]);
     TEST_ASSERT_EQUAL_HEX8(0x90, response[responseLength - 2]);
+}
+
+// The key and digest of RFC 6979 A.2.5, the ones the board's power-up
+// self-test signs with.
+constexpr uint8_t kRfc6979Scalar[32] = {
+    0xC9, 0xAF, 0xA9, 0xD8, 0x45, 0xBA, 0x75, 0x16, 0x6B, 0x5C, 0x21,
+    0x57, 0x67, 0xB1, 0xD6, 0x93, 0x4E, 0x50, 0xC3, 0xDB, 0x36, 0xE8,
+    0x9B, 0x12, 0x7B, 0x8A, 0x62, 0x2B, 0x12, 0x0F, 0x67, 0x21,
+};
+constexpr uint8_t kSampleDigest[32] = {
+    0xAF, 0x2B, 0xDB, 0xE1, 0xAA, 0x9B, 0x6E, 0xC1, 0xE2, 0xAD, 0xE1,
+    0xD6, 0x94, 0xF4, 0x1F, 0xC7, 0x1A, 0x83, 0x1D, 0x02, 0x68, 0xE9,
+    0x89, 0x15, 0x62, 0x11, 0x3D, 0x8A, 0x62, 0xAD, 0xD1, 0xBF,
+};
+// The order of the P-256 group.
+constexpr uint8_t kGroupOrder[32] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17,
+    0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
+};
+
+// Z, then x, then h, with Z and x each padded so the secret scalar starts its
+// own SHA-256 block. tools/hedged_ecdsa_reference.py prints the same bytes.
+void test_hedged_nonce_seed_follows_the_reference_layout() {
+    uint8_t randomness[32];
+    for (size_t index = 0; index < sizeof(randomness); ++index) {
+        randomness[index] = static_cast<uint8_t>(index);
+    }
+    uint8_t seed[deskid::kHedgedNonceSeedSize];
+    std::memset(seed, 0xEE, sizeof(seed));
+    deskid::hedgedNonceSeed(randomness, kRfc6979Scalar, kSampleDigest, seed);
+
+    constexpr uint8_t zeros[63] = {};
+    TEST_ASSERT_EQUAL_UINT32(191, sizeof(seed));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(randomness, seed, 32);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(zeros, seed + 32, 63);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(kRfc6979Scalar, seed + 95, 32);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(zeros, seed + 127, 32);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(kSampleDigest, seed + 159, 32);
+}
+
+// RFC 6979 feeds the generator bits2octets(h), the digest reduced below the
+// group order. One digest in four billion needs it, so it gets its own test.
+void test_hedged_nonce_seed_reduces_a_digest_at_or_above_the_group_order() {
+    constexpr uint8_t randomness[32] = {};
+    uint8_t seed[deskid::kHedgedNonceSeedSize];
+    uint8_t expected[32] = {};
+
+    deskid::hedgedNonceSeed(randomness, kRfc6979Scalar, kGroupOrder, seed);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, seed + 159, 32);
+
+    // Order + 0x1AF: the addition carries out of the last byte, so the
+    // subtraction has to borrow back through it.
+    uint8_t above[32];
+    std::memcpy(above, kGroupOrder, sizeof(above));
+    above[31] = 0x00;
+    above[30] = 0x27;
+    expected[31] = 0xAF;
+    expected[30] = 0x01;
+    deskid::hedgedNonceSeed(randomness, kRfc6979Scalar, above, seed);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, seed + 159, 32);
+
+    uint8_t below[32];
+    std::memcpy(below, kGroupOrder, sizeof(below));
+    below[31] = 0x50;
+    deskid::hedgedNonceSeed(randomness, kRfc6979Scalar, below, seed);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(below, seed + 159, 32);
+}
+
+// A board whose signing self-test failed says so in the status object, where
+// a host can read it without a fingerprint.
+void test_status_object_reports_a_failed_signing_self_test() {
+    selectApplet();
+    diagnostics.signingSelfTestPassed = false;
+    constexpr uint8_t getStatus[] = {
+        0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xFF, 0x01, 0x00,
+    };
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(getStatus, sizeof(getStatus), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    constexpr uint8_t tail[] = {0x15, 0x01, 0x00, 0xFE, 0x00, 0x90, 0x00};
+    TEST_ASSERT_GREATER_THAN_UINT32(sizeof(tail), responseLength);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(
+        tail, response.data() + responseLength - sizeof(tail), sizeof(tail));
 }
 
 int main(int, char **) {
@@ -1027,5 +1116,8 @@ int main(int, char **) {
     RUN_TEST(test_enrollment_is_gated_while_the_template_count_is_unknown);
     RUN_TEST(test_verify_expires_instead_of_waiting_for_a_signature);
     RUN_TEST(test_status_object_fits_the_longest_version_string);
+    RUN_TEST(test_hedged_nonce_seed_follows_the_reference_layout);
+    RUN_TEST(test_hedged_nonce_seed_reduces_a_digest_at_or_above_the_group_order);
+    RUN_TEST(test_status_object_reports_a_failed_signing_self_test);
     return UNITY_END();
 }

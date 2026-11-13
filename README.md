@@ -19,7 +19,8 @@ The clip shows a locked Mac unlocking on one touch, in real time, on the first h
 - PIV application selection, Discovery, CCC, CHUID, certificate object `5FC105`, response chaining, `VERIFY`, and ECC P-256 `GENERAL AUTHENTICATE` for slot `9A`.
 - Host-driven authentication. macOS sends an APDU, CCID reports time extensions while the R503 waits, and a matching fingerprint releases the signature. The device sends no unsolicited APDU.
 - Touch first. The sensor is scanned between requests. A match is held for 30 s and can be spent once, by `VERIFY` or `GENERAL AUTHENTICATE`. See [Touch first](#touch-first).
-- PSA Crypto signing with a P-256 key and a matching X.509 certificate in NVS. The identity comes from a host image or is generated on the device (`GENERATE ASYMMETRIC KEY PAIR` `0x47` and `PUT DATA` `0xDB`).
+- A P-256 key and a matching X.509 certificate in NVS. The identity comes from a host image or is generated on the device (`GENERATE ASYMMETRIC KEY PAIR` `0x47` and `PUT DATA` `0xDB`).
+- ECDSA with a hedged nonce. See [Signature nonce](#signature-nonce).
 - A diagnostic channel over PC/SC, because this board has no serial console: a status object at `GET DATA 5FFF01`, and `80 F0 00 00 00` to reboot into ROM download mode without a BOOT press. On this board `80 F0` lands in USB-OTG DFU. See [Entering download mode](#entering-download-mode).
 - R503 packet validation, timeouts, password rotation and security level `3`, the R503 default. Enrollment runs over the card channel (`80 E1 00 00 00`) because a soldered sensor has no other host.
 - Development and production firmware profiles, and host-side APDU tests.
@@ -331,7 +332,8 @@ python3 tools/hw_smoke_test.py --status
 - whether a credential is present;
 - consecutive failed matches and remaining lockout;
 - the number of fingerprint templates in the sensor;
-- the level of the wake line.
+- the level of the wake line;
+- whether the signing self-test passed at power-up.
 
 The build variant matters: a `deskid-bringup` unit approves each presence request.
 
@@ -346,6 +348,24 @@ python3 tools/hw_smoke_test.py --download-mode   # or send 80 F0 00 00 00 yourse
 `80 F0` is user-presence gated, so a host cannot trigger it without a touch. It is compiled out of `deskid-production`: `DESKID_ALLOW_DOWNLOAD_MODE` is set on `deskid` and `deskid-bringup`, and the production environment inherits from `[deskid_common]`, which does not carry the flag.
 
 Measured 2026-09-01: the reboot happens and the ROM comes up in USB-OTG DFU (`303A:0009`), so `pio run -t upload` cannot follow it. [Entering download mode](#entering-download-mode) explains the cause and the BOOT hold that works.
+
+### Signature nonce
+
+An ECDSA signature needs a secret number used once. A repeated or biased one gives the private key to anyone who holds the signatures, so the firmware does not leave it to the random generator alone. It seeds an HMAC_DRBG with 32 fresh random bytes, the private scalar and the digest, and takes the nonce from that:
+
+```
+Z || 63 zero bytes || x || 32 zero bytes || bits2octets(h)
+```
+
+This is RFC 6979 with the input layout of `draft-irtf-cfrg-det-sigs-with-noise-05`. If the random generator fails, the nonce is still what RFC 6979 would give: secret, and different for each digest. While the generator works, two signatures of one digest differ, which plain RFC 6979 does not offer and which the differential fault attacks on it rely on. Verifiers see ordinary ECDSA.
+
+PSA Crypto has randomized ECDSA and RFC 6979, and no way to pass a nonce source in. The firmware therefore calls `mbedtls_ecdsa_sign` from the private half of TF-PSA-Crypto 1.0, the version ESP-IDF 6.0.1 ships. A platform upgrade has to rebuild and rerun the checks below.
+
+Three checks cover it:
+
+- `pio test -e native` pins the seed layout, byte for byte.
+- At power-up the board signs the RFC 6979 A.2.5 key and digest with a fixed `Z` and compares the result with a known answer. `--status` reports it, and a board that fails refuses to sign. `python3 tools/hedged_ecdsa_reference.py` derives that answer in the standard library and first reproduces the RFC's own vector.
+- `python3 tools/hw_smoke_test.py --nonce` signs one digest twice, checks both signatures against the certificate and requires them to differ. It takes two touches.
 
 ### PIN prompt
 
