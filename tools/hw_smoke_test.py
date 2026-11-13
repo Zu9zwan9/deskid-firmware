@@ -793,7 +793,7 @@ def main() -> int:
             say("\nenrollment")
             card = Card(context, reader)
             try:
-                run_enroll(card, report, args.placements)
+                run_enroll(card, report, arguments.placements)
             finally:
                 card.close()
 
