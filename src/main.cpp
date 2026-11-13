@@ -756,9 +756,11 @@ public:
 
     // WAKEUP is a shortcut, not a requirement: GenImg answers 0x02 when the
     // ring is untouched, so an unwired or broken wake line costs a UART round
-    // trip rather than the sensor.
+    // trip rather than the sensor. A line stuck high is the same kind of
+    // broken: believing it reports a finger forever, so the gate never sees
+    // the ring released and refuses a second touch until it times out.
     bool fingerPresent() {
-        if (wakeLineHigh()) {
+        if (wakeLineUsable() && wakeLineHigh()) {
             return true;
         }
         uint8_t confirmation = 0xFF;
