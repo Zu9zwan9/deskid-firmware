@@ -1785,6 +1785,9 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
     return true;
 #else
     g_lastGateInstruction = request.apduLength > 1 ? request.apdu[1] : 0;
+    // Only a submitted PIN field makes macOS ask for this, so digits typed
+    // for a match that woke the Mac have landed.
+    g_autotype.hostActed();
     g_lastGateOutcome = 2;
     // A touch that already happened answers the login instructions with no
     // wait at all. It is spent here whether or not what follows succeeds, so
@@ -2011,6 +2014,10 @@ extern "C" void app_main() {
                 g_ringArmedUntilMs = std::max<uint64_t>(
                     g_ringArmedUntilMs,
                     nowMs + g_autotype.secondsRemaining(nowMs) * 1000ULL);
+            }
+            if (g_autotype.retype(millisecondsSinceBoot())) {
+                // The first digits met a display that was still coming up.
+                typeDummyPin();
             }
             deskid::publishAutotypeStatus(
                 g_autotype.secondsRemaining(millisecondsSinceBoot()),

@@ -304,6 +304,14 @@ public:
     /// that is asleep, so this needs no arming. The digits still wait for
     /// the host to say its lock screen is lit.
     void wokeHost(uint64_t nowMilliseconds);
+    /// True when digits typed for a match that woke the Mac got no answer and
+    /// are due again. macOS drops keys for a couple of seconds while a
+    /// display comes up, and says nothing. What proves they landed is the
+    /// host asking the card for a private-key operation: see hostActed().
+    bool retype(uint64_t nowMilliseconds);
+    /// The host asked the card for something only a login asks for, so the
+    /// digits landed and nothing more is typed.
+    void hostActed();
     uint32_t emissions() const;
 
     /// The `index`-th eight-byte keyboard report of an emission.
@@ -314,10 +322,24 @@ public:
 
 private:
     uint64_t armedUntilMilliseconds_ = 0;
+    void forgetWoken();
+
     uint64_t wokenUntilMilliseconds_ = 0;
+    /// Zero until the host has given its word for the woken match.
+    uint64_t retypeAtMilliseconds_ = 0;
     uint32_t emissions_ = 0;
+    uint8_t retypesLeft_ = 0;
     bool toWake_ = false;
 };
+
+/// How long digits typed for a woken match wait for the host to act before
+/// they are typed again, counted from the host's word. Typing takes 0.8 s of
+/// it. A display with an external monitor took 2.0 s from the wake tap to
+/// taking keys (measured 2026-11-13, macOS 27.0.1).
+constexpr uint32_t kRetypeMilliseconds = 2200;
+/// Typed again at most this often. If the Mac is not paired with the card,
+/// the digits are a wrong password each time.
+constexpr uint8_t kMaximumRetypes = 2;
 
 /// How long a match that woke the Mac waits for the host to say the lock
 /// screen is lit. A display lights in under a second and a Mac takes a few
