@@ -52,6 +52,11 @@ constexpr uint8_t kArmOnSelectSeconds = 20;
 /// process asks first, hours later.
 constexpr uint64_t kVerifiedValidMilliseconds = 30000;
 
+/// How long one match of an enrolled finger keeps enrollment open. Long
+/// enough to lift that finger and place a new one twice, short enough that a
+/// session nobody finished has closed before the board changes hands.
+constexpr uint64_t kEnrollmentSessionMilliseconds = 60000;
+
 struct DeviceStatus {
     const char *firmwareVersion = "";
     uint8_t buildVariant = 0;
@@ -145,6 +150,9 @@ public:
                                 bool userPresent, uint8_t *response,
                                 size_t responseCapacity, size_t &responseLength);
     void reset();
+    /// An enrolled finger has vouched for a new one and the template is not
+    /// stored yet. The ring belongs to the enrollment until it is.
+    bool enrollmentOpen() const;
 
 private:
     void drainPending(size_t requestedLength, uint8_t *response,
@@ -161,6 +169,7 @@ private:
     bool selected_ = false;
     bool verified_ = false;
     uint64_t verifiedAtMilliseconds_ = 0;
+    uint64_t enrollmentOpenUntilMilliseconds_ = 0;
 };
 
 class RateLimiter {

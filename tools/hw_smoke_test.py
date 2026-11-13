@@ -74,6 +74,7 @@ ENROLL_STAGES = {
     0x00: "place your finger on the sensor",
     0x01: "captured — now lift your finger off the sensor",
     0x02: "touch the same finger again",
+    0x04: "authorized — lift that finger, then place the one to enroll",
     ENROLL_STAGE_DONE: "enrolled and stored",
     ENROLL_STAGE_FAILED: "that attempt failed — starting over",
 }
@@ -82,7 +83,9 @@ ENROLL_ERRORS = {
     SW_AUTHENTICATION_BLOCKED: "6983 — the rate limiter has locked the sensor out",
     SW_INSTRUCTION_NOT_SUPPORTED: "6D00 — the flashed image is deskid-bringup, which has no sensor",
 }
-ENROLL_TIMEOUT_SECONDS = 60.0
+# The blue ring waits 30 s for the authorizing match, and the match then keeps
+# the enrollment open for 60 s (kEnrollmentSessionMilliseconds).
+ENROLL_TIMEOUT_SECONDS = 90.0
 ENROLL_POLL_SECONDS = 0.25
 ENROLL_FAILURE_LIMIT = 3
 
