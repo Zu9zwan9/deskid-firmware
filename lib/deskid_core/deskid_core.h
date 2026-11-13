@@ -52,10 +52,14 @@ constexpr uint8_t kArmOnSelectSeconds = 20;
 /// process asks first, hours later.
 constexpr uint64_t kVerifiedValidMilliseconds = 30000;
 
-/// How long one match of an enrolled finger keeps enrollment open. Long
-/// enough to lift that finger and place a new one twice, short enough that a
-/// session nobody finished has closed before the board changes hands.
+/// How long one match of an enrolled finger, and then each stored placement,
+/// keeps enrollment open. Long enough to lift the finger and place the next,
+/// short enough that a session nobody finished has closed before the board
+/// changes hands.
 constexpr uint64_t kEnrollmentSessionMilliseconds = 60000;
+/// How many placements of a finger one match pays for. A small sensor sees a
+/// part of the finger at a time, so a finger is a set of templates.
+constexpr uint8_t kEnrollmentSessionTemplates = 12;
 
 struct DeviceStatus {
     const char *firmwareVersion = "";
@@ -170,6 +174,7 @@ private:
     bool verified_ = false;
     uint64_t verifiedAtMilliseconds_ = 0;
     uint64_t enrollmentOpenUntilMilliseconds_ = 0;
+    uint8_t enrollmentSessionTemplates_ = 0;
 };
 
 class RateLimiter {

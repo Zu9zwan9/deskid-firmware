@@ -137,6 +137,8 @@ constexpr uint8_t kMaximumArmSeconds = 120;
 // by that same limiter and by the fact that an attacker must already hold
 // the device.
 constexpr uint8_t kFingerprintSecurityLevel = 3;
+// How long a finger rests on the ring before its enrollment image is taken.
+constexpr int64_t kEnrollSettleMilliseconds = 300;
 // A held finger gets several captures before it has to lift, the way Touch ID
 // keeps trying: partial contact and a smeared first image are the normal case,
 // not an attack. Every rejected *match* still counts against the rate limiter.
@@ -1138,77 +1140,84 @@ public:
         }
         templateCount_ = 0;
         templateCountKnown_ = true;
-        enrollStage_ = 0;
         enrollRingSeenEmpty_ = false;
+        enrollFingerDownAtUs_ = 0;
         return true;
     }
 
+    // One image is one template. Two touches that had to agree with each
+    // other could not record how a finger lands when nobody is thinking
+    // about it, and that is the placement worth having: on 2026-11-13 pairs
+    // of natural touches failed to merge for minutes. A finger is a set of
+    // such templates, the way a phone records one from many placements.
     uint8_t enrollStep() {
-        if (enrollStage_ == 0) {
-            // The first image has to come from a touch that began for it. The
-            // finger that authorized this enrollment is still on the ring
-            // when the first step runs, and capturing it would enroll the
-            // finger the sensor already has.
-            if (!enrollRingSeenEmpty_) {
-                const bool present = fingerPresent();
-                // A failed attempt keeps its red flash: the next look would
-                // otherwise replace it within one poll.
-                if (showing(Ring::failure)) {
-                    return present ? 4 : 0;
-                }
-                if (present) {
-                    show(Ring::enrollLift);
-                    return 4;
-                }
-                enrollRingSeenEmpty_ = true;
-                show(Ring::enrollPlace);
+        const bool present = fingerPresent();
+        // The first image has to come from a touch that began for it. The
+        // finger that authorized this enrollment, or the placement stored a
+        // moment ago, is still on the ring when the step runs, and capturing
+        // it again would add nothing.
+        if (!enrollRingSeenEmpty_) {
+            // The last look, stored or failed, finishes before the next.
+            if (ringBusy()) {
+                return present ? 4 : 0;
             }
-            const uint8_t confirmation = captureInto(0x01);
-            if (confirmation == 0x02) {
-                return 0;
+            if (present) {
+                show(Ring::enrollLift);
+                return 4;
             }
-            if (confirmation != 0x00) {
-                return abortEnrollment();
-            }
-            enrollStage_ = 1;
-            show(Ring::enrollLift);
-            return 1;
-        }
-        if (enrollStage_ == 1) {
-            if (fingerPresent()) {
-                return 1;
-            }
-            enrollStage_ = 2;
+            enrollRingSeenEmpty_ = true;
             show(Ring::enrollPlace);
-            return 2;
         }
-        uint8_t confirmation = captureInto(0x02);
+        if (!present) {
+            enrollFingerDownAtUs_ = 0;
+            return 0;
+        }
+        // An image taken as the finger lands is smeared, and with one image a
+        // template there is no second to make up for it.
+        const int64_t now = esp_timer_get_time();
+        if (enrollFingerDownAtUs_ == 0) {
+            enrollFingerDownAtUs_ = now;
+        }
+        if (now - enrollFingerDownAtUs_ < kEnrollSettleMilliseconds * 1000LL) {
+            return 0;
+        }
+        uint8_t confirmation = captureInto(0x01);
         if (confirmation == 0x02) {
-            return 2;
+            return 0;
+        }
+        if (confirmation != 0x00) {
+            return abortEnrollment(Ring::adjust);
         }
         // DeskID never deletes a template, so the library has no gaps and the
         // count is also the next free page. A count the sensor never reported
         // would aim this at page 0 and overwrite whoever is enrolled there.
         if (!templateCountKnown_) {
-            return abortEnrollment();
+            return abortEnrollment(Ring::failure);
+        }
+        // RegModel wants two character files and gets the same image twice.
+        // ponytail: if this unit refuses that, the character file in buffer
+        // 1 is stored as it is; the two have one format on this sensor
+        // family. Which path ran is not reported.
+        const uint8_t second[] = {0x02};
+        size_t responseLength = 0;
+        if (command(0x02, second, sizeof(second), confirmation, nullptr, 0,
+                    responseLength) &&
+            confirmation == 0x00) {
+            command(0x05, nullptr, 0, confirmation, nullptr, 0,
+                    responseLength);
         }
         const uint8_t store[] = {
             0x01,
             static_cast<uint8_t>(templateCount_ >> 8),
             static_cast<uint8_t>(templateCount_),
         };
-        size_t responseLength = 0;
-        if (confirmation != 0x00 ||
-            !command(0x05, nullptr, 0, confirmation, nullptr, 0,
-                     responseLength) ||
-            confirmation != 0x00 ||
-            !command(0x06, store, sizeof(store), confirmation, nullptr, 0,
+        if (!command(0x06, store, sizeof(store), confirmation, nullptr, 0,
                      responseLength) ||
             confirmation != 0x00) {
-            return abortEnrollment();
+            return abortEnrollment(Ring::failure);
         }
-        enrollStage_ = 0;
         enrollRingSeenEmpty_ = false;
+        enrollFingerDownAtUs_ = 0;
         refreshTemplateCount();
         show(Ring::enrollStored);
         return 3;
@@ -1456,10 +1465,10 @@ private:
         return confirmation;
     }
 
-    uint8_t abortEnrollment() {
-        enrollStage_ = 0;
+    uint8_t abortEnrollment(Ring look) {
         enrollRingSeenEmpty_ = false;
-        showFailure();
+        enrollFingerDownAtUs_ = 0;
+        show(look);
         return 0xFF;
     }
 
@@ -1496,7 +1505,7 @@ private:
         {0x01, 0x01, 0},     // lockedOut: red, breathing
         {0x01, 0x03, 0},     // enrollPlace: purple, breathing
         {0x03, 0x03, 0},     // enrollLift: purple
-        {0x02, 0x06, 2000},  // enrollStored: cyan, flashing
+        {0x02, 0x06, 1000},  // enrollStored: cyan, flashing
     };
 
     void setLed(uint8_t control, uint8_t color, uint8_t times) {
@@ -1518,8 +1527,8 @@ private:
     uint8_t lastConfirmation_ = 0;
     uint16_t templateCount_ = 0;
     bool templateCountKnown_ = false;
-    uint8_t enrollStage_ = 0;
     bool enrollRingSeenEmpty_ = false;
+    int64_t enrollFingerDownAtUs_ = 0;
     // Unknown at power-up, so anything but off: the first off is then sent.
     Ring ring_ = Ring::touched;
     int64_t ringOffAtUs_ = 0;

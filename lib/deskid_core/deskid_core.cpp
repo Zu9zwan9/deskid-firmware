@@ -838,7 +838,8 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
         // that failed to answer at boot hand out free enrollment.
         //
         // After that a new finger is vouched for by an old one, once. The
-        // match opens a session for a single template, and inside it the
+        // match opens a session for one finger, which is up to
+        // kEnrollmentSessionTemplates placements of it, and inside it the
         // steps ask for no further match. They used to ask every time, and
         // each image was then taken from the touch that had just matched, so
         // the only finger that could be added was one the sensor already
@@ -853,9 +854,18 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
             return TransceiveStatus::complete;
         }
         if (stage == 0x03) {
-            // Stored. One match pays for one template.
-            enrollmentOpenUntilMilliseconds_ = 0;
+            // Stored. One match pays for one finger: each placement leaves a
+            // fresh window for the next, until the finger is complete. The
+            // first template of an empty library starts the count itself.
+            enrollmentSessionTemplates_ =
+                open ? enrollmentSessionTemplates_ + 1 : 1;
+            enrollmentOpenUntilMilliseconds_ =
+                enrollmentSessionTemplates_ < kEnrollmentSessionTemplates
+                    ? diagnostics_.uptimeMilliseconds() +
+                          kEnrollmentSessionMilliseconds
+                    : 0;
         } else if (userPresent && !open) {
+            enrollmentSessionTemplates_ = 0;
             enrollmentOpenUntilMilliseconds_ =
                 diagnostics_.uptimeMilliseconds() +
                 kEnrollmentSessionMilliseconds;
