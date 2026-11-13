@@ -1357,6 +1357,29 @@ void test_autotype_presses_and_releases_keypad_digits_then_return() {
     TEST_ASSERT_EQUAL_UINT32(0, deskid::Autotype::kReportCount % 2);
 }
 
+void test_wake_line_is_believed_after_both_levels_and_reads_its_touched_level() {
+    // The R503 holds WAKEUP high and drives it low for as long as a finger
+    // is on the ring.
+    deskid::WakeLine line(false);
+    line.observe(true);
+    TEST_ASSERT_FALSE(line.usable());
+    // A level that has never changed says nothing: it reads the same on a
+    // wire that was never soldered.
+    TEST_ASSERT_FALSE(line.touched(false));
+    line.observe(false);
+    TEST_ASSERT_TRUE(line.usable());
+    TEST_ASSERT_TRUE(line.touched(false));
+    // Resting high is an empty ring. Reading it as a finger is the fault
+    // this class was written after.
+    TEST_ASSERT_FALSE(line.touched(true));
+
+    deskid::WakeLine activeHigh(true);
+    activeHigh.observe(false);
+    activeHigh.observe(true);
+    TEST_ASSERT_TRUE(activeHigh.touched(true));
+    TEST_ASSERT_FALSE(activeHigh.touched(false));
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_selects_standard_piv_aid);
@@ -1406,5 +1429,6 @@ int main(int, char **) {
     RUN_TEST(test_status_object_reports_a_failed_signing_self_test);
     RUN_TEST(test_autotype_fires_once_per_arming_and_only_inside_the_window);
     RUN_TEST(test_autotype_presses_and_releases_keypad_digits_then_return);
+    RUN_TEST(test_wake_line_is_believed_after_both_levels_and_reads_its_touched_level);
     return UNITY_END();
 }

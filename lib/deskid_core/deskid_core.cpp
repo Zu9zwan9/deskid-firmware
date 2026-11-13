@@ -1090,4 +1090,14 @@ void hedgedNonceSeed(const uint8_t randomness[32], const uint8_t scalar[32],
     }
 }
 
+WakeLine::WakeLine(bool touchedLevel) : touchedLevel_(touchedLevel) {}
+
+void WakeLine::observe(bool level) { seen_ |= level ? 0b10 : 0b01; }
+
+bool WakeLine::usable() const { return seen_ == 0b11; }
+
+bool WakeLine::touched(bool level) const {
+    return usable() && level == touchedLevel_;
+}
+
 }  // namespace deskid
