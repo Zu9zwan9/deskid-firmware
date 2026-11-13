@@ -82,7 +82,7 @@ class FakeDiagnostics final : public deskid::DeviceDiagnostics {
 public:
     deskid::DeviceStatus status() const override {
         deskid::DeviceStatus value;
-        value.firmwareVersion = "9.9.9";
+        value.firmwareVersion = firmwareVersion;
         value.buildVariant = 2;
         value.uptimeSeconds = 0x00010203;
         value.resetReason = 4;
@@ -93,6 +93,7 @@ public:
         value.consecutiveFailures = 3;
         value.lockoutSecondsRemaining = 42;
         value.enrolledTemplates = enrolledTemplates;
+        value.templateCountKnown = templateCountKnown;
         value.wakeLineHigh = true;
         value.lastMatchMilliseconds = 1234;
         value.earlyTouchGates = 7;
@@ -101,6 +102,8 @@ public:
         value.ringArmedSecondsRemaining = 42;
         return value;
     }
+
+    uint64_t uptimeMilliseconds() const override { return nowMilliseconds; }
 
     bool enterDownloadMode() override {
         ++downloadModeRequests;
@@ -135,6 +138,29 @@ public:
     size_t forgetRequests = 0;
     bool forgetSupported = true;
     uint32_t enrolledTemplates = 2;
+    bool templateCountKnown = true;
+    uint64_t nowMilliseconds = 0;
+    const char *firmwareVersion = "9.9.9";
+};
+
+// NVS as the limiter sees it: what was last written is all that survives a
+// pulled plug.
+class FakeLimiterStore final : public deskid::LimiterStore {
+public:
+    bool save(uint32_t consecutiveFailures, uint32_t lockoutCount) override {
+        if (!healthy) {
+            return false;
+        }
+        failures = consecutiveFailures;
+        lockouts = lockoutCount;
+        ++writes;
+        return true;
+    }
+
+    bool healthy = true;
+    uint32_t failures = 0;
+    uint32_t lockouts = 0;
+    size_t writes = 0;
 };
 
 FakeCredential credential;
@@ -168,6 +194,9 @@ void setUp() {
     diagnostics.forgetRequests = 0;
     diagnostics.downloadModeRequests = 0;
     diagnostics.enrolledTemplates = 2;
+    diagnostics.templateCountKnown = true;
+    diagnostics.nowMilliseconds = 0;
+    diagnostics.firmwareVersion = "9.9.9";
     response.fill(0);
 }
 
@@ -825,6 +854,141 @@ void test_selecting_the_applet_arms_the_ring() {
     TEST_ASSERT_EQUAL_UINT8(deskid::kArmOnSelectSeconds, diagnostics.armedSeconds);
 }
 
+// The verdict is the secret. A limiter that counts a failure after hearing it
+// can be starved by cutting power in between, so the attempt is charged, and
+// written down, before the sensor is asked.
+void test_attempt_is_charged_before_the_verdict_and_survives_power_loss() {
+    FakeLimiterStore store;
+    deskid::RateLimiter limiter(3, 1000, 4000);
+    deskid::AttemptLedger ledger(limiter, store);
+
+    TEST_ASSERT_TRUE(ledger.charge(0));
+    TEST_ASSERT_EQUAL_UINT32(1, store.failures);
+    TEST_ASSERT_TRUE(ledger.charge(0));
+    TEST_ASSERT_EQUAL_UINT32(2, store.failures);
+
+    // The plug is pulled here, with no verdict ever heard for either attempt.
+    deskid::RateLimiter rebooted(3, 1000, 4000);
+    rebooted.restore(store.failures, store.lockouts, 0);
+    deskid::AttemptLedger afterReboot(rebooted, store);
+    TEST_ASSERT_TRUE(afterReboot.charge(0));
+    TEST_ASSERT_TRUE(rebooted.locked(0));
+    TEST_ASSERT_EQUAL_UINT32(1, store.lockouts);
+    TEST_ASSERT_FALSE(afterReboot.charge(0));
+    TEST_ASSERT_FALSE(afterReboot.charge(999));
+    TEST_ASSERT_TRUE(afterReboot.charge(1000));
+}
+
+void test_a_match_clears_the_charge_and_says_so_on_disk() {
+    FakeLimiterStore store;
+    deskid::RateLimiter limiter(3, 1000, 4000);
+    deskid::AttemptLedger ledger(limiter, store);
+
+    TEST_ASSERT_TRUE(ledger.charge(0));
+    TEST_ASSERT_TRUE(ledger.charge(0));
+    // The last permitted attempt arms the lockout before its verdict, and a
+    // match must still be able to clear it.
+    TEST_ASSERT_TRUE(ledger.charge(0));
+    TEST_ASSERT_TRUE(limiter.locked(0));
+    ledger.matched();
+    TEST_ASSERT_FALSE(limiter.locked(0));
+    TEST_ASSERT_EQUAL_UINT32(0, store.failures);
+    TEST_ASSERT_EQUAL_UINT32(0, store.lockouts);
+}
+
+void test_an_attempt_that_cannot_be_written_down_is_refused() {
+    FakeLimiterStore store;
+    store.healthy = false;
+    deskid::RateLimiter limiter(3, 1000, 4000);
+    deskid::AttemptLedger ledger(limiter, store);
+
+    TEST_ASSERT_FALSE(ledger.charge(0));
+    TEST_ASSERT_EQUAL_UINT32(0, store.writes);
+    // Refused, but not forgotten: the attempt still counts in memory.
+    TEST_ASSERT_EQUAL_UINT32(1, limiter.consecutiveFailures());
+}
+
+// "Zero templates" opens enrollment to anyone, so it has to be something the
+// sensor said, not the value a counter happens to start at.
+void test_enrollment_is_gated_while_the_template_count_is_unknown() {
+    selectApplet();
+    diagnostics.enrolledTemplates = 0;
+    diagnostics.templateCountKnown = false;
+    constexpr uint8_t enroll[] = {0x80, 0xE1, 0x00, 0x00, 0x00};
+    const size_t before = diagnostics.enrollRequests;
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(enroll, sizeof(enroll), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(before, diagnostics.enrollRequests);
+
+    constexpr uint8_t forget[] = {0x80, 0xE2, 0x00, 0x00, 0x00};
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(forget, sizeof(forget), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(0, diagnostics.forgetRequests);
+}
+
+// A verified touch is spent by the next signature, and it must not wait for
+// one indefinitely: a card left selected would otherwise hold a signature in
+// reserve for whichever process asks first.
+void test_verify_expires_instead_of_waiting_for_a_signature() {
+    selectApplet();
+    constexpr uint8_t verify[] = {
+        0x00, 0x20, 0x00, 0x80, 0x08, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+    constexpr uint8_t verifyStatus[] = {0x00, 0x20, 0x00, 0x80};
+    std::array<uint8_t, 44> authenticate = {
+        0x00, 0x87, 0x11, 0x9A, 0x26, 0x7C, 0x24, 0x82, 0x00, 0x81, 0x20,
+    };
+    size_t responseLength = 0;
+
+    diagnostics.nowMilliseconds = 5000;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(verify, sizeof(verify), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+    diagnostics.nowMilliseconds = 5000 + deskid::kVerifiedValidMilliseconds - 1;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(verifyStatus, sizeof(verifyStatus),
+                                        false, response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_HEX8(0x90, response[0]);
+
+    diagnostics.nowMilliseconds = 5000 + deskid::kVerifiedValidMilliseconds;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(verifyStatus, sizeof(verifyStatus),
+                                        false, response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_HEX8(0x63, response[0]);
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(authenticate.data(), authenticate.size(),
+                                        false, response.data(), response.size(),
+                                        responseLength));
+}
+
+// The version field is allowed sixteen characters, so the object has to fit
+// with all sixteen in it.
+void test_status_object_fits_the_longest_version_string() {
+    selectApplet();
+    diagnostics.firmwareVersion = "10.20.30-rc1+abc";
+    constexpr uint8_t getStatus[] = {
+        0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xFF, 0x01, 0x00,
+    };
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(getStatus, sizeof(getStatus), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(2 + 82 + 16 + 2, responseLength);
+    TEST_ASSERT_EQUAL_HEX8(0x53, response[0]);
+    TEST_ASSERT_EQUAL_HEX8(82 + 16, response[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x90, response[responseLength - 2]);
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_selects_standard_piv_aid);
@@ -857,5 +1021,11 @@ int main(int, char **) {
     RUN_TEST(test_selecting_the_applet_arms_the_ring);
     RUN_TEST(test_early_touch_answers_only_the_login_instructions);
     RUN_TEST(test_early_touch_is_single_use_and_expires);
+    RUN_TEST(test_attempt_is_charged_before_the_verdict_and_survives_power_loss);
+    RUN_TEST(test_a_match_clears_the_charge_and_says_so_on_disk);
+    RUN_TEST(test_an_attempt_that_cannot_be_written_down_is_refused);
+    RUN_TEST(test_enrollment_is_gated_while_the_template_count_is_unknown);
+    RUN_TEST(test_verify_expires_instead_of_waiting_for_a_signature);
+    RUN_TEST(test_status_object_fits_the_longest_version_string);
     return UNITY_END();
 }

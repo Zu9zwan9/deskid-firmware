@@ -134,6 +134,9 @@ alignas(4) uint8_t s_outPacket[kEndpointSize];
 alignas(4) uint8_t s_receivedMessage[kMaximumMessageLength];
 alignas(4) uint8_t s_transmitMessage[kMaximumMessageLength];
 CcidRequest s_requestBuffer;
+// The USB task fills the buffer and the main task empties it, and a host that
+// aborts and resends can make those overlap.
+portMUX_TYPE s_requestLock = portMUX_INITIALIZER_UNLOCKED;
 size_t s_receivedLength = 0;
 size_t s_expectedLength = 0;
 uint8_t s_rootPort = 0;
@@ -312,8 +315,13 @@ void processMessage(const uint8_t *message, size_t length) {
                              0);
                 break;
             }
+            // A request that was aborted or powered off may still be waiting
+            // in the queue for the main task. Its buffer is not ours to reuse
+            // until it has been collected, or that task would run this APDU
+            // under the old one's notification.
             if (apduLength > CcidRequest::kMaximumApduLength ||
-                s_pendingRequest.load() != 0) {
+                s_pendingRequest.load() != 0 ||
+                uxQueueMessagesWaiting(s_requestQueue) != 0) {
                 sendResponse(kReaderToPcDataBlock, slot, sequence,
                              kCommandFailedActive,
                              apduLength > CcidRequest::kMaximumApduLength
@@ -323,11 +331,13 @@ void processMessage(const uint8_t *message, size_t length) {
                 break;
             }
 
+            portENTER_CRITICAL(&s_requestLock);
             s_requestBuffer.slot = slot;
             s_requestBuffer.sequence = sequence;
             s_requestBuffer.powerEpoch = s_powerEpoch.load();
             s_requestBuffer.apduLength = apduLength;
             std::memcpy(s_requestBuffer.apdu, apdu, apduLength);
+            portEXIT_CRITICAL(&s_requestLock);
             s_abortedRequest.store(0);
             s_pendingRequest.store(kPendingFlag | sequence);
             constexpr uint8_t notification = 1;
@@ -504,6 +514,19 @@ bool endpointTransfer(uint8_t rootPort, uint8_t endpoint,
         s_receivedLength = 0;
         s_expectedLength = 0;
     }
+
+    // A short packet ends a transfer. If the message it ended is still
+    // incomplete, host and reader disagree about its length, and waiting for
+    // the rest would glue the next message onto this one for good.
+    if (s_receivedLength != 0 && transferredBytes < kEndpointSize) {
+        if (s_receivedLength >= kHeaderSize) {
+            sendSlotFailure(s_receivedMessage[5], s_receivedMessage[6],
+                            kBadLength);
+        }
+        std::memset(s_receivedMessage, 0, s_receivedLength);
+        s_receivedLength = 0;
+        s_expectedLength = 0;
+    }
     armOutEndpoint();
     return true;
 }
@@ -557,10 +580,12 @@ bool waitForCcidRequest(CcidRequest &request, uint32_t timeoutMilliseconds) {
         notification != 1) {
         return false;
     }
+    portENTER_CRITICAL(&s_requestLock);
     request = s_requestBuffer;
     std::memset(s_requestBuffer.apdu, 0, s_requestBuffer.apduLength);
     s_requestBuffer.powerEpoch = 0;
     s_requestBuffer.apduLength = 0;
+    portEXIT_CRITICAL(&s_requestLock);
     return true;
 }
 

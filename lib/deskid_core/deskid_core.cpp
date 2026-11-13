@@ -309,6 +309,7 @@ void PivApplet::reset() {
     pendingLength_ = 0;
     selected_ = false;
     verified_ = false;
+    verifiedAtMilliseconds_ = 0;
 }
 
 void PivApplet::drainPending(size_t requestedLength, uint8_t *response,
@@ -347,6 +348,11 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
         status(0x6700, response, responseCapacity, responseLength);
         return TransceiveStatus::complete;
     }
+
+    auto libraryKnownEmpty = [&]() {
+        const DeviceStatus device = diagnostics_.status();
+        return device.templateCountKnown && device.enrolledTemplates == 0;
+    };
 
     auto sendData = [&](const uint8_t *data, size_t length,
                         size_t requestedLength) {
@@ -517,7 +523,8 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
             const size_t versionLength =
                 std::min<size_t>(std::strlen(version), 16);
 
-            uint8_t encoded[96];
+            // 53 L, 82 fixed bytes, and up to 16 of version.
+            uint8_t encoded[2 + 82 + 16];
             Writer writer(encoded, sizeof(encoded));
             if (!writer.byte(0x53) || !writer.length(82 + versionLength) ||
                 !writer.byte(0x01) ||
@@ -569,8 +576,8 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
             return TransceiveStatus::complete;
         }
         if (apdu.data.size == 0) {
-            status(verified_ ? 0x9000 : 0x63C3, response, responseCapacity,
-                   responseLength);
+            status(verificationHeld() ? 0x9000 : 0x63C3, response,
+                   responseCapacity, responseLength);
             return TransceiveStatus::complete;
         }
         if (apdu.data.size != 8) {
@@ -581,6 +588,7 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
             return TransceiveStatus::userPresenceRequired;
         }
         verified_ = true;
+        verifiedAtMilliseconds_ = diagnostics_.uptimeMilliseconds();
         status(0x9000, response, responseCapacity, responseLength);
         return TransceiveStatus::complete;
     }
@@ -680,7 +688,7 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
             status(0x6A88, response, responseCapacity, responseLength);
             return TransceiveStatus::complete;
         }
-        if (!verified_ && !userPresent) {
+        if (!verificationHeld() && !userPresent) {
             return TransceiveStatus::userPresenceRequired;
         }
 
@@ -716,7 +724,10 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
         }
         // An empty sensor can never produce a match, so the first finger has
         // to enroll unauthenticated. Emptying it needs the sensor password.
-        if (diagnostics_.status().enrolledTemplates != 0 && !userPresent) {
+        // Empty has to be something the sensor reported: an unknown count is
+        // treated as a full library, because the alternative lets a sensor
+        // that failed to answer at boot hand out free enrollment.
+        if (!libraryKnownEmpty() && !userPresent) {
             return TransceiveStatus::userPresenceRequired;
         }
         uint8_t stage = 0;
@@ -752,7 +763,7 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
         // replaced, so demanding a match from an already empty library would
         // make the recovery it exists for impossible. There is also nothing
         // there to protect.
-        if (diagnostics_.status().enrolledTemplates == 0) {
+        if (libraryKnownEmpty()) {
             status(0x9000, response, responseCapacity, responseLength);
             return TransceiveStatus::complete;
         }
@@ -780,6 +791,17 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
 
     status(0x6D00, response, responseCapacity, responseLength);
     return TransceiveStatus::complete;
+}
+
+// A verified touch is good for one signature and for a bounded time. Checking
+// it is also what retires a stale one.
+bool PivApplet::verificationHeld() {
+    if (verified_ && diagnostics_.uptimeMilliseconds() -
+                             verifiedAtMilliseconds_ >=
+                         kVerifiedValidMilliseconds) {
+        verified_ = false;
+    }
+    return verified_;
 }
 
 bool PivApplet::provisioned() const {
@@ -846,6 +868,23 @@ uint64_t RateLimiter::lockoutDuration(uint32_t lockoutCount) const {
     return std::min(maximumLockoutMilliseconds_,
                     baseLockoutMilliseconds_
                         << std::min<uint32_t>(lockoutCount, 20));
+}
+
+AttemptLedger::AttemptLedger(RateLimiter &limiter, LimiterStore &store)
+    : limiter_(limiter), store_(store) {}
+
+bool AttemptLedger::charge(uint64_t nowMilliseconds) {
+    if (limiter_.locked(nowMilliseconds)) {
+        return false;
+    }
+    limiter_.recordFailure(nowMilliseconds);
+    return store_.save(limiter_.consecutiveFailures(),
+                       limiter_.lockoutCount());
+}
+
+void AttemptLedger::matched() {
+    limiter_.recordSuccess();
+    store_.save(limiter_.consecutiveFailures(), limiter_.lockoutCount());
 }
 
 EarlyTouch::EarlyTouch(uint64_t validMilliseconds)

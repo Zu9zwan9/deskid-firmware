@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "bootloader_random.h"
 #include "ccid_device.h"
 #include "deskid_core.h"
 #include "driver/gpio.h"
@@ -119,6 +120,20 @@ void secureZero(void *data, size_t length) {
 uint64_t millisecondsSinceBoot() {
     return static_cast<uint64_t>(esp_timer_get_time() / 1000);
 }
+
+// No radio ever runs on this board, and ESP-IDF only documents the hardware
+// RNG as truly random while Wi-Fi or Bluetooth is up or this SAR ADC noise
+// source is switched on. It samples a reserved internal channel, not a pad, so
+// it does not disturb GPIO4. It is held only across the operations whose
+// output has to be unpredictable: seeding PSA's generator, the sensor
+// password, key generation and signing.
+class EntropySource {
+public:
+    EntropySource() { bootloader_random_enable(); }
+    ~EntropySource() { bootloader_random_disable(); }
+    EntropySource(const EntropySource &) = delete;
+    EntropySource &operator=(const EntropySource &) = delete;
+};
 
 struct DerElement {
     uint8_t tag = 0;
@@ -309,6 +324,7 @@ public:
     }
 
     esp_err_t initialize() {
+        const EntropySource entropy;
         if (psa_crypto_init() != PSA_SUCCESS) {
             return ESP_FAIL;
         }
@@ -346,6 +362,7 @@ public:
 
         uint8_t rawSignature[64];
         size_t rawSignatureLength = 0;
+        const EntropySource entropy;
         if (psa_sign_hash(keyId_, PSA_ALG_ECDSA(PSA_ALG_SHA_256),
                           digest.data, digest.size, rawSignature,
                           sizeof(rawSignature),
@@ -389,6 +406,7 @@ public:
         psa_set_key_usage_flags(
             &attributes, PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_EXPORT);
         psa_set_key_algorithm(&attributes, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+        const EntropySource entropy;
         const psa_status_t generateStatus =
             psa_generate_key(&attributes, &pendingKeyId_);
         psa_reset_key_attributes(&attributes);
@@ -738,9 +756,11 @@ public:
 
     // WAKEUP is a shortcut, not a requirement: GenImg answers 0x02 when the
     // ring is untouched, so an unwired or broken wake line costs a UART round
-    // trip rather than the sensor.
+    // trip rather than the sensor. A line stuck high is the same kind of
+    // broken: believing it reports a finger forever, so the gate never sees
+    // the ring released and refuses a second touch until it times out.
     bool fingerPresent() {
-        if (wakeLineHigh()) {
+        if (wakeLineUsable() && wakeLineHigh()) {
             return true;
         }
         uint8_t confirmation = 0xFF;
@@ -757,7 +777,8 @@ public:
                 verifyPassword(password));
     }
 
-    MatchResult captureAndMatch(uint16_t &fingerId, uint16_t &confidence) {
+    MatchResult captureAndMatch(uint16_t &fingerId, uint16_t &confidence,
+                                deskid::AttemptLedger &ledger) {
         fingerId = 0;
         confidence = 0;
 
@@ -777,6 +798,13 @@ public:
         constexpr uint8_t imageBuffer[] = {0x01};
         if (!command(0x02, imageBuffer, sizeof(imageBuffer), confirmation,
                      nullptr, 0, responseLength) || confirmation != 0x00) {
+            return MatchResult::sensorError;
+        }
+
+        // Search is the verdict, so the attempt is charged and written down
+        // before it is sent: see deskid::AttemptLedger. Nothing above this
+        // line tells an attacker anything, and nothing below it is free.
+        if (!ledger.charge(millisecondsSinceBoot())) {
             return MatchResult::sensorError;
         }
 
@@ -816,6 +844,7 @@ public:
             return false;
         }
         templateCount_ = 0;
+        templateCountKnown_ = true;
         enrollStage_ = 0;
         return true;
     }
@@ -846,7 +875,11 @@ public:
             return 2;
         }
         // DeskID never deletes a template, so the library has no gaps and the
-        // count is also the next free page.
+        // count is also the next free page. A count the sensor never reported
+        // would aim this at page 0 and overwrite whoever is enrolled there.
+        if (!templateCountKnown_) {
+            return abortEnrollment();
+        }
         const uint8_t store[] = {
             0x01,
             static_cast<uint8_t>(templateCount_ >> 8),
@@ -881,6 +914,7 @@ public:
     uint8_t state() const { return state_; }
     uint8_t lastConfirmation() const { return lastConfirmation_; }
     uint16_t templateCount() const { return templateCount_; }
+    bool templateCountKnown() const { return templateCountKnown_; }
 
     // The R503 stores the level itself, so a reboot puts the compiled default
     // back: this is a live measurement aid, not a setting.
@@ -1085,6 +1119,7 @@ private:
             confirmation == 0x00 && responseLength == sizeof(response)) {
             templateCount_ =
                 static_cast<uint16_t>(response[0] << 8 | response[1]);
+            templateCountKnown_ = true;
         }
     }
 
@@ -1101,6 +1136,7 @@ private:
     uint32_t password_ = 0;
     uint8_t lastConfirmation_ = 0;
     uint16_t templateCount_ = 0;
+    bool templateCountKnown_ = false;
     uint8_t enrollStage_ = 0;
 };
 
@@ -1153,6 +1189,7 @@ public:
         value.lockoutSecondsRemaining = static_cast<uint32_t>(
             (limiter_.lockoutMillisecondsRemaining(now) + 999) / 1000);
         value.enrolledTemplates = sensor_.templateCount();
+        value.templateCountKnown = sensor_.templateCountKnown();
         value.wakeLineHigh = sensor_.wakeLineHigh();
         value.lastMatchMilliseconds = g_lastMatchMilliseconds;
         value.lastGateOutcome = g_lastGateOutcome;
@@ -1168,6 +1205,10 @@ public:
             std::min<uint64_t>(
                 255, (g_earlyTouch.millisecondsRemaining(now) + 999) / 1000));
         return value;
+    }
+
+    uint64_t uptimeMilliseconds() const override {
+        return millisecondsSinceBoot();
     }
 
     bool enrollStep(uint8_t &stage) override {
@@ -1222,42 +1263,53 @@ private:
     bool downloadModePending_ = false;
 };
 
-uint32_t savedFailureCount = 0;
-uint32_t savedLockoutCount = 0;
-
 // The lockout has to outlive a power cycle, or unplugging the device would be
 // the cheapest way to clear a run of failed matches.
-void loadLimiterState(deskid::RateLimiter &limiter) {
-    nvs_handle_t handle;
-    if (nvs_open(kStorageNamespace, NVS_READONLY, &handle) != ESP_OK) {
-        return;
+class NvsLimiterStore final : public deskid::LimiterStore {
+public:
+    void load(deskid::RateLimiter &limiter) {
+        nvs_handle_t handle;
+        if (nvs_open(kStorageNamespace, NVS_READONLY, &handle) != ESP_OK) {
+            return;
+        }
+        nvs_get_u32(handle, kFailureCountKey, &savedFailures_);
+        nvs_get_u32(handle, kLockoutCountKey, &savedLockouts_);
+        nvs_close(handle);
+        limiter.restore(savedFailures_, savedLockouts_,
+                        millisecondsSinceBoot());
     }
-    nvs_get_u32(handle, kFailureCountKey, &savedFailureCount);
-    nvs_get_u32(handle, kLockoutCountKey, &savedLockoutCount);
-    nvs_close(handle);
-    limiter.restore(savedFailureCount, savedLockoutCount,
-                    millisecondsSinceBoot());
-}
 
-void saveLimiterState(const deskid::RateLimiter &limiter) {
-    if (limiter.consecutiveFailures() == savedFailureCount &&
-        limiter.lockoutCount() == savedLockoutCount) {
-        return;
+    // Two entries cannot be written as one, so the order is chosen for the
+    // plug being pulled between them. The lockout count goes first: a torn
+    // write then leaves a new lockout beside a stale, higher failure count,
+    // which is stricter than either state and never more lenient.
+    bool save(uint32_t consecutiveFailures, uint32_t lockoutCount) override {
+        if (consecutiveFailures == savedFailures_ &&
+            lockoutCount == savedLockouts_) {
+            return true;
+        }
+        nvs_handle_t handle;
+        if (nvs_open(kStorageNamespace, NVS_READWRITE, &handle) != ESP_OK) {
+            return false;
+        }
+        const bool written =
+            nvs_set_u32(handle, kLockoutCountKey, lockoutCount) == ESP_OK &&
+            nvs_commit(handle) == ESP_OK &&
+            nvs_set_u32(handle, kFailureCountKey, consecutiveFailures) ==
+                ESP_OK &&
+            nvs_commit(handle) == ESP_OK;
+        nvs_close(handle);
+        if (written) {
+            savedFailures_ = consecutiveFailures;
+            savedLockouts_ = lockoutCount;
+        }
+        return written;
     }
-    nvs_handle_t handle;
-    if (nvs_open(kStorageNamespace, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
-    }
-    if (nvs_set_u32(handle, kFailureCountKey,
-                    limiter.consecutiveFailures()) == ESP_OK &&
-        nvs_set_u32(handle, kLockoutCountKey, limiter.lockoutCount()) ==
-            ESP_OK &&
-        nvs_commit(handle) == ESP_OK) {
-        savedFailureCount = limiter.consecutiveFailures();
-        savedLockoutCount = limiter.lockoutCount();
-    }
-    nvs_close(handle);
-}
+
+private:
+    uint32_t savedFailures_ = 0;
+    uint32_t savedLockouts_ = 0;
+};
 
 // One poll of the idle ring. The sensor is live between host requests, not
 // only while one is waiting, so a finger that lands on arrival is matched
@@ -1268,12 +1320,14 @@ void saveLimiterState(const deskid::RateLimiter &limiter) {
 //
 // At most one capture per call, so a request arriving mid-match waits for one
 // match and not for a loop.
-void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter) {
+void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
+                       deskid::AttemptLedger &ledger) {
 #if defined(DESKID_BRINGUP_NO_SENSOR)
     // No sensor, so no touch to be early with; the gate approves everything
     // anyway and pretending otherwise would hide that in the status object.
     (void)sensor;
     (void)limiter;
+    (void)ledger;
 #else
     // sensorState 1 is "the R503 answered". An unwired or dead sensor must
     // not turn this into a UART probe every 40 ms forever.
@@ -1314,23 +1368,21 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter) {
     }
     uint16_t fingerId = 0;
     uint16_t confidence = 0;
-    switch (sensor.captureAndMatch(fingerId, confidence)) {
+    switch (sensor.captureAndMatch(fingerId, confidence, ledger)) {
         case R503Sensor::MatchResult::matched:
             g_lastMatchMilliseconds = static_cast<uint32_t>(
                 (esp_timer_get_time() - g_idleTouchStartedAtUs) / 1000);
             g_idleRetriesThisTouch = 0;
-            limiter.recordSuccess();
+            ledger.matched();
             g_earlyTouch.record(millisecondsSinceBoot());
             sensor.showSuccess();
             vTaskDelay(pdMS_TO_TICKS(250));
             sensor.turnLedOff();
             g_idleRingLit = false;
             g_idleWaitForRemoval = true;
-            saveLimiterState(limiter);
             return;
         case R503Sensor::MatchResult::notMatched:
-            limiter.recordFailure(millisecondsSinceBoot());
-            saveLimiterState(limiter);
+            // Already charged and written down, before the verdict.
             if (!limiter.locked(millisecondsSinceBoot()) &&
                 ++g_idleRetriesThisTouch < kRetriesPerTouch) {
                 return;  // still the same finger; try the next image
@@ -1347,7 +1399,8 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter) {
             // stays lit while the next poll tries again — blinking it off and
             // on per attempt would read as a sensor that keeps losing the
             // finger.
-            if (++g_idleRetriesThisTouch >= kRetriesPerTouch * 2) {
+            if (++g_idleRetriesThisTouch >= kRetriesPerTouch * 2 ||
+                limiter.locked(millisecondsSinceBoot())) {
                 sensor.turnLedOff();
                 g_idleRingLit = false;
                 g_idleWaitForRemoval = true;
@@ -1358,6 +1411,7 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter) {
 }
 
 bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
+                          deskid::AttemptLedger &ledger,
                           const deskid::CcidRequest &request,
                           uint32_t powerEpoch) {
 #if defined(DESKID_BRINGUP_NO_SENSOR)
@@ -1366,6 +1420,7 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
     // wired to restore the real match gate.
     (void)sensor;
     (void)limiter;
+    (void)ledger;
     (void)request;
     (void)powerEpoch;
     return true;
@@ -1434,19 +1489,19 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
         deskid::sendCcidTimeExtension(request);
         uint16_t fingerId = 0;
         uint16_t confidence = 0;
-        switch (sensor.captureAndMatch(fingerId, confidence)) {
+        switch (sensor.captureAndMatch(fingerId, confidence, ledger)) {
             case R503Sensor::MatchResult::matched:
                 g_lastMatchMilliseconds = static_cast<uint32_t>(
                     (esp_timer_get_time() - fingerSeenAt) / 1000);
                 g_lastGateOutcome = 1;
-                limiter.recordSuccess();
+                ledger.matched();
                 sensor.showSuccess();
                 vTaskDelay(pdMS_TO_TICKS(250));
                 sensor.turnLedOff();
                 g_idleWaitForRemoval = true;
                 return true;
             case R503Sensor::MatchResult::notMatched:
-                limiter.recordFailure(millisecondsSinceBoot());
+                // Already charged and written down, before the verdict.
                 if (limiter.locked(millisecondsSinceBoot())) {
                     sensor.showFailure();
                     sensor.turnLedOff();
@@ -1461,6 +1516,14 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
                 waitForFingerRemoval = true;
                 break;
             case R503Sensor::MatchResult::sensorError:
+                // The last permitted attempt is charged before its verdict.
+                // If the sensor then gave none, the lockout stands.
+                if (limiter.locked(millisecondsSinceBoot())) {
+                    sensor.showFailure();
+                    sensor.turnLedOff();
+                    g_idleWaitForRemoval = true;
+                    return false;
+                }
                 // Usually "image too messy" from Img2Tz: the finger moved or
                 // only half landed. Try again while it is still there.
                 if (++retriesThisTouch < kRetriesPerTouch * 2) {
@@ -1509,7 +1572,9 @@ extern "C" void app_main() {
     static deskid::RateLimiter presenceLimiter(
         kFingerprintFailureThreshold, kFingerprintBaseLockoutMilliseconds,
         kFingerprintMaximumLockoutMilliseconds);
-    loadLimiterState(presenceLimiter);
+    static NvsLimiterStore limiterStore;
+    limiterStore.load(presenceLimiter);
+    static deskid::AttemptLedger attempts(presenceLimiter, limiterStore);
     static BoardDiagnostics diagnostics(credential, sensor, presenceLimiter);
     static deskid::PivApplet applet(credential, diagnostics);
     ESP_ERROR_CHECK(deskid::installCcidDevice());
@@ -1529,17 +1594,21 @@ extern "C" void app_main() {
             }
             sensor.observeWakeLine();
             if (sensor.wakeLineUsable()) {
-                scanForEarlyTouch(sensor, presenceLimiter);
+                scanForEarlyTouch(sensor, presenceLimiter, attempts);
             } else if (ringArmed() && now >= nextArmedScan) {
                 nextArmedScan =
                     now + static_cast<int64_t>(kArmedScanMilliseconds) * 1000LL;
-                scanForEarlyTouch(sensor, presenceLimiter);
+                scanForEarlyTouch(sensor, presenceLimiter, attempts);
             }
             continue;
         }
 
         const uint32_t requestPowerEpoch = request.powerEpoch;
-        if (deskid::ccidPowerEpoch() != requestPowerEpoch) {
+        // A request the host re-powered the card under, or withdrew, is not
+        // run at all: some instructions need no fingerprint, and running them
+        // for a host that has stopped listening only desynchronises the two.
+        if (deskid::ccidPowerEpoch() != requestPowerEpoch ||
+            deskid::ccidRequestWasAborted(request)) {
             secureZero(request.apdu, request.apduLength);
             request.apduLength = 0;
             continue;
@@ -1555,8 +1624,8 @@ extern "C" void app_main() {
             sizeof(response), responseLength);
         if (transceiveStatus ==
             deskid::TransceiveStatus::userPresenceRequired) {
-            if (authorizeFingerprint(sensor, presenceLimiter, request,
-                                     requestPowerEpoch)) {
+            if (authorizeFingerprint(sensor, presenceLimiter, attempts,
+                                     request, requestPowerEpoch)) {
                 transceiveStatus = applet.transceive(
                     request.apdu, request.apduLength, true, response,
                     sizeof(response), responseLength);
@@ -1568,7 +1637,6 @@ extern "C" void app_main() {
                 responseLength = 2;
                 transceiveStatus = deskid::TransceiveStatus::complete;
             }
-            saveLimiterState(presenceLimiter);
         }
 
         if (transceiveStatus != deskid::TransceiveStatus::complete ||
