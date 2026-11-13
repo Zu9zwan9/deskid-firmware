@@ -1078,6 +1078,61 @@ void test_status_object_reports_a_failed_signing_self_test() {
         tail, response.data() + responseLength - sizeof(tail), sizeof(tail));
 }
 
+void test_autotype_fires_once_per_arming_and_only_inside_the_window() {
+    deskid::Autotype autotype;
+    // A touch the host did not ask to have typed types nothing.
+    TEST_ASSERT_FALSE(autotype.take(1000));
+
+    autotype.arm(10, 1000);
+    TEST_ASSERT_EQUAL_UINT8(10, autotype.secondsRemaining(1000));
+    TEST_ASSERT_EQUAL_UINT8(1, autotype.secondsRemaining(10999));
+    TEST_ASSERT_TRUE(autotype.take(10999));
+    // One arming is one emission: a second touch needs a second arming.
+    TEST_ASSERT_FALSE(autotype.take(10999));
+    TEST_ASSERT_EQUAL_UINT8(0, autotype.secondsRemaining(10999));
+
+    autotype.arm(10, 20000);
+    TEST_ASSERT_FALSE(autotype.take(30000));
+    TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
+
+    // A host cannot hold the board armed, and zero seconds disarms it.
+    autotype.arm(255, 40000);
+    TEST_ASSERT_EQUAL_UINT8(deskid::kMaximumAutotypeSeconds,
+                            autotype.secondsRemaining(40000));
+    autotype.arm(0, 41000);
+    TEST_ASSERT_FALSE(autotype.take(41000));
+    TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
+}
+
+void test_autotype_presses_and_releases_keypad_digits_then_return() {
+    uint32_t digits = 0;
+    for (size_t index = 0; index < deskid::Autotype::kReportCount; ++index) {
+        uint8_t report[8];
+        std::memset(report, 0xAA, sizeof(report));
+        deskid::Autotype::report(index, report);
+        // No modifiers and never two keys at once.
+        TEST_ASSERT_EQUAL_UINT8(0, report[0]);
+        TEST_ASSERT_EQUAL_UINT8(0, report[1]);
+        for (size_t slot = 3; slot < sizeof(report); ++slot) {
+            TEST_ASSERT_EQUAL_UINT8(0, report[slot]);
+        }
+        if (index % 2 == 1) {
+            // Every press is followed by a release, the last report included:
+            // a key left down repeats until something else is typed.
+            TEST_ASSERT_EQUAL_UINT8(0, report[2]);
+        } else if (index + 2 == deskid::Autotype::kReportCount) {
+            TEST_ASSERT_EQUAL_UINT8(0x28, report[2]);  // Return
+        } else {
+            // Keypad 1 to Keypad 0: digits under every keyboard layout.
+            TEST_ASSERT_TRUE(report[2] >= 0x59 && report[2] <= 0x62);
+            ++digits;
+        }
+    }
+    // VERIFY carries a PIN of six to eight digits.
+    TEST_ASSERT_EQUAL_UINT32(6, digits);
+    TEST_ASSERT_EQUAL_UINT32(0, deskid::Autotype::kReportCount % 2);
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_selects_standard_piv_aid);
@@ -1119,5 +1174,7 @@ int main(int, char **) {
     RUN_TEST(test_hedged_nonce_seed_follows_the_reference_layout);
     RUN_TEST(test_hedged_nonce_seed_reduces_a_digest_at_or_above_the_group_order);
     RUN_TEST(test_status_object_reports_a_failed_signing_self_test);
+    RUN_TEST(test_autotype_fires_once_per_arming_and_only_inside_the_window);
+    RUN_TEST(test_autotype_presses_and_releases_keypad_digits_then_return);
     return UNITY_END();
 }

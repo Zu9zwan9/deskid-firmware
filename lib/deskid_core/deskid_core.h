@@ -245,4 +245,40 @@ private:
     uint32_t gates_ = 0;
 };
 
+/// The longest a host may ask the board to type for it. Long enough to reach
+/// the ring after a prompt appears, short enough that an arming nobody used
+/// has lapsed before another window takes the keyboard.
+constexpr uint8_t kMaximumAutotypeSeconds = 15;
+
+// The digits macOS asks for, typed by the board.
+//
+// macOS draws a PIN field for every smart card and the applet ignores what is
+// typed into it: the fingerprint is the check. So after a match the board can
+// type the digits and Return itself over USB HID, and a login is one touch.
+// What it types is a constant and unlocks nothing. The signature that follows
+// still has to spend the fingerprint match, as it does when a person types.
+//
+// The board cannot see the screen. The host says when a PIN field has the
+// keyboard, and that permission is short and single use, because keystrokes
+// sent at any other moment land in whatever window is in front.
+class Autotype {
+public:
+    /// Reports in one emission: a press and a release for each key.
+    static constexpr size_t kReportCount = 14;
+
+    /// Zero seconds disarms.
+    void arm(uint8_t seconds, uint64_t nowMilliseconds);
+    uint8_t secondsRemaining(uint64_t nowMilliseconds) const;
+    /// True once per arming, inside its window. The caller then types.
+    bool take(uint64_t nowMilliseconds);
+    uint32_t emissions() const;
+
+    /// The `index`-th eight-byte keyboard report of an emission.
+    static void report(size_t index, uint8_t report[8]);
+
+private:
+    uint64_t armedUntilMilliseconds_ = 0;
+    uint32_t emissions_ = 0;
+};
+
 }  // namespace deskid

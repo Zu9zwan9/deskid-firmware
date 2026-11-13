@@ -27,12 +27,26 @@
 #error "Production builds require an authorized VID/PID in platformio.ini"
 #endif
 
+// A sdkconfig generated before the HID interfaces existed keeps its own zero
+// and builds a device whose descriptors name drivers that are not there.
+#if CFG_TUD_HID != 2
+#error "CONFIG_TINYUSB_HID_COUNT must be 2: delete sdkconfig.<env> to apply sdkconfig.defaults"
+#endif
+
 namespace deskid {
 namespace {
 
 constexpr uint8_t kInterfaceNumber = 0;
 constexpr uint8_t kBulkOutEndpoint = 0x01;
 constexpr uint8_t kBulkInEndpoint = 0x81;
+// TinyUSB numbers HID instances in the order their interfaces appear.
+constexpr uint8_t kKeyboardInterface = 1;
+constexpr uint8_t kKeyboardInstance = 0;
+constexpr uint8_t kKeyboardEndpoint = 0x82;
+constexpr uint8_t kArmingInterface = 2;
+constexpr uint8_t kArmingInstance = 1;
+constexpr uint8_t kArmingEndpoint = 0x83;
+constexpr uint8_t kArmAutotypeCommand = 0x01;
 constexpr size_t kEndpointSize = 64;
 constexpr size_t kHeaderSize = 10;
 constexpr size_t kMaximumMessageLength = 2048;
@@ -85,15 +99,50 @@ constexpr tusb_desc_device_t kDeviceDescriptor = {
     .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor = DESKID_USB_VID,
     .idProduct = DESKID_USB_PID,
-    .bcdDevice = 0x0100,
+    .bcdDevice = 0x0110,
     .iManufacturer = 1,
     .iProduct = 2,
     .iSerialNumber = 3,
     .bNumConfigurations = 1,
 };
 
+// Eight bytes: modifiers, a reserved byte and six keys. No report ID and no
+// boot subclass, since nothing here has to type into firmware setup screens.
+constexpr uint8_t kKeyboardReportDescriptor[] = {
+    TUD_HID_REPORT_DESC_KEYBOARD()};
+
+// The arming interface is its own HID interface on a vendor usage page, not a
+// second collection on the keyboard. macOS folds every collection of one
+// interface into a single device, and opening a device whose first usage is a
+// keyboard needs the Input Monitoring permission. A vendor device does not.
+//
+// Feature report, host to board: 0x01, seconds. Board to host: 0x01, seconds
+// the arming has left, emissions since power-up. The input report exists
+// because a HID interface must have an interrupt IN endpoint; it is never sent.
+constexpr uint8_t kArmingReportDescriptor[] = {
+    0x06, 0x00, 0xFF,  // Usage Page (vendor 0xFF00)
+    0x09, 0x01,        // Usage (1)
+    0xA1, 0x01,        // Collection (Application)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x26, 0xFF, 0x00,  //   Logical Maximum (255)
+    0x75, 0x08,        //   Report Size (8)
+    0x95, 0x08,        //   Report Count (8)
+    0x09, 0x02,        //   Usage (2)
+    0xB1, 0x02,        //   Feature (Data, Variable, Absolute)
+    0x09, 0x03,        //   Usage (3)
+    0x81, 0x02,        //   Input (Data, Variable, Absolute)
+    0xC0,              // End Collection
+};
+constexpr size_t kArmingReportSize = 8;
+
+constexpr uint16_t kConfigurationLength = 86 + 2 * TUD_HID_DESC_LEN;
+
+// Device class 0 and no interface association: CCID and HID are one interface
+// each, which is how a YubiKey presents the same three functions. Four IN
+// endpoints with endpoint 0, one under what the ESP32-S3 can keep active.
 constexpr uint8_t kConfigurationDescriptor[] = {
-    9, TUSB_DESC_CONFIGURATION, 86, 0, 1, 1, 0, 0x80, 100,
+    9, TUSB_DESC_CONFIGURATION, U16_TO_U8S_LE(kConfigurationLength), 3, 1, 0,
+    0x80, 100,
     9, TUSB_DESC_INTERFACE, kInterfaceNumber, 0, 2, TUSB_CLASS_SMART_CARD, 0, 0, 4,
     0x36, TUSB_DESC_FUNCTIONAL,
     0x10, 0x01,
@@ -120,9 +169,15 @@ constexpr uint8_t kConfigurationDescriptor[] = {
     static_cast<uint8_t>(kEndpointSize), 0, 0,
     7, TUSB_DESC_ENDPOINT, kBulkInEndpoint, TUSB_XFER_BULK,
     static_cast<uint8_t>(kEndpointSize), 0, 0,
+    TUD_HID_DESCRIPTOR(kKeyboardInterface, 0, HID_ITF_PROTOCOL_NONE,
+                       sizeof(kKeyboardReportDescriptor), kKeyboardEndpoint,
+                       8, 10),
+    TUD_HID_DESCRIPTOR(kArmingInterface, 0, HID_ITF_PROTOCOL_NONE,
+                       sizeof(kArmingReportDescriptor), kArmingEndpoint,
+                       kArmingReportSize, 10),
 };
 
-static_assert(sizeof(kConfigurationDescriptor) == 86);
+static_assert(sizeof(kConfigurationDescriptor) == kConfigurationLength);
 
 constexpr uint8_t kAtr[] = {0x3B, 0x80, 0x01, 0x81};
 constexpr uint8_t kT1Parameters[] = {0x11, 0x10, 0x00, 0x4D,
@@ -148,6 +203,11 @@ QueueHandle_t s_requestQueue = nullptr;
 SemaphoreHandle_t s_transmitAvailable = nullptr;
 std::atomic<uint16_t> s_pendingRequest{0};
 std::atomic<uint16_t> s_abortedRequest{0};
+// kPendingFlag marks a request the main task has not taken yet; the low byte
+// is the seconds asked for, and zero is a real request: it disarms.
+std::atomic<uint16_t> s_autotypeArm{0};
+std::atomic<uint8_t> s_autotypeSecondsRemaining{0};
+std::atomic<uint8_t> s_autotypeEmissions{0};
 std::atomic<uint32_t> s_powerEpoch{0};
 std::atomic<uint32_t> s_secureRequests{0};
 char s_serialNumber[13] = {};
@@ -620,7 +680,71 @@ bool ccidRequestWasAborted(const CcidRequest &request) {
 uint32_t ccidPowerEpoch() { return s_powerEpoch.load(); }
 uint32_t ccidSecureRequests() { return s_secureRequests.load(); }
 
+bool takeAutotypeArm(uint8_t &seconds) {
+    const uint16_t request = s_autotypeArm.exchange(0);
+    seconds = static_cast<uint8_t>(request);
+    return (request & kPendingFlag) != 0;
+}
+
+void publishAutotypeStatus(uint8_t secondsRemaining, uint32_t emissions) {
+    s_autotypeSecondsRemaining.store(secondsRemaining);
+    s_autotypeEmissions.store(
+        static_cast<uint8_t>(std::min<uint32_t>(emissions, 0xFF)));
+}
+
+bool sendKeyboardReport(const uint8_t report[8]) {
+    // The endpoint is polled every 10 ms, so the previous report has gone
+    // well inside this unless the host has stopped listening.
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        if (tud_hid_n_ready(kKeyboardInstance)) {
+            return tud_hid_n_report(kKeyboardInstance, 0, report, 8);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return false;
+}
+
 }  // namespace deskid
+
+extern "C" const uint8_t *tud_hid_descriptor_report_cb(uint8_t instance) {
+    return instance == deskid::kKeyboardInstance
+               ? deskid::kKeyboardReportDescriptor
+               : deskid::kArmingReportDescriptor;
+}
+
+extern "C" uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t,
+                                          hid_report_type_t type,
+                                          uint8_t *buffer, uint16_t length) {
+    if (instance != deskid::kArmingInstance ||
+        type != HID_REPORT_TYPE_FEATURE ||
+        length < deskid::kArmingReportSize) {
+        return 0;
+    }
+    std::memset(buffer, 0, deskid::kArmingReportSize);
+    buffer[0] = 0x01;
+    buffer[1] = deskid::s_autotypeSecondsRemaining.load();
+    buffer[2] = deskid::s_autotypeEmissions.load();
+    return deskid::kArmingReportSize;
+}
+
+extern "C" void tud_hid_set_report_cb(uint8_t instance, uint8_t,
+                                      hid_report_type_t type,
+                                      const uint8_t *buffer, uint16_t length) {
+#if defined(DESKID_ALLOW_AUTOTYPE)
+    // Anything else addressed to either interface, the keyboard's LED report
+    // included, is ignored. The seconds are capped where they are used.
+    if (instance == deskid::kArmingInstance &&
+        type == HID_REPORT_TYPE_FEATURE && length >= 2 &&
+        buffer[0] == deskid::kArmAutotypeCommand) {
+        deskid::s_autotypeArm.store(deskid::kPendingFlag | buffer[1]);
+    }
+#else
+    (void)instance;
+    (void)type;
+    (void)buffer;
+    (void)length;
+#endif
+}
 
 extern "C" const usbd_class_driver_t *usbd_app_driver_get_cb(
     uint8_t *driverCount) {
