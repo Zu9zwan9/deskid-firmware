@@ -34,15 +34,15 @@ The ring says what the board wants:
 | dark | idle; the sensor still scans |
 | white, breathing | a request waits for a touch |
 | blue | contact, the image is being read |
-| cyan, 0.7 s | match |
+| green, 0.7 s | match |
 | red, flashing | the touch was rejected |
 | yellow, flashing | no usable image: lift and lie flatter |
 | red, breathing | locked out; shown while a finger rests on the ring |
 | purple, breathing | enrollment: place the finger |
 | purple | enrollment: lift the finger |
-| cyan, flashing | enrollment: template stored |
+| green, flashing | enrollment: template stored |
 
-R503 units without a green LED have red, blue and purple only. A look the sensor refuses is sent again less its green, so white becomes purple, cyan blue and yellow red. The looks are `kRingLooks` in `src/main.cpp`.
+R503 units without a green LED have red, blue and purple only. A look the sensor refuses is sent again less its green, so white becomes purple and yellow red, and green itself becomes blue. The looks are `kRingLooks` in `src/main.cpp`.
 
 ## Hardware
 
@@ -244,7 +244,7 @@ macOS draws its own PIN field for a smart card at the lock screen and in `pam_sm
 
 The firmware now scans the sensor between host requests. A match is kept for 30 s and spent by the next login instruction:
 
-1. Touch the sensor as you sit down. The ring turns solid blue on contact, matches in about 0.8 s and shows cyan.
+1. Touch the sensor as you sit down. The ring turns solid blue on contact, matches in about 0.8 s and shows green.
 2. Type any digits and press Return.
 3. The card answers without waiting. Status tag `0x0E` reports that an earlier touch answered, and `0x11` counts those answers.
 
