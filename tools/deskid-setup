@@ -121,9 +121,15 @@ if [ ! -x "$BINARY" ] || [ "$SOURCE" -nt "$BINARY" ] || [ "$TOKEN_SOURCE" -nt "$
     xcrun swiftc -O -parse-as-library -application-extension -module-name DeskIDToken \
         -Xlinker -e -Xlinker _NSExtensionMain \
         "$TOKEN_SOURCE" -o "$APPEX/Contents/MacOS/DeskIDToken"
-    xcrun swiftc -O -parse-as-library -application-extension -module-name DeskIDPersistent \
-        -Xlinker -e -Xlinker _NSExtensionMain \
-        "$PERSISTENT_SOURCE" -o "$PERSISTENT_APPEX/Contents/MacOS/DeskIDPersistent"
+    # The persistent-token source is the record of experiment E1a and is absent
+    # from some checkouts. The app and the smart-card driver build without it.
+    if [ -f "$PERSISTENT_SOURCE" ]; then
+        xcrun swiftc -O -parse-as-library -application-extension -module-name DeskIDPersistent \
+            -Xlinker -e -Xlinker _NSExtensionMain \
+            "$PERSISTENT_SOURCE" -o "$PERSISTENT_APPEX/Contents/MacOS/DeskIDPersistent"
+    else
+        rm -rf "$PERSISTENT_APPEX"
+    fi
     # Swift allows top-level code only in a file called main.swift, and
     # deskid_setup.swift is all top-level. Compiling it alone was fine; adding
     # the assist module makes the name matter, so it is copied rather than
@@ -135,8 +141,10 @@ if [ ! -x "$BINARY" ] || [ "$SOURCE" -nt "$BINARY" ] || [ "$TOKEN_SOURCE" -nt "$
 
     codesign --sign "$IDENTITY" --force --options runtime \
         --entitlements "$ENTITLEMENTS/token.plist" "$APPEX"
-    codesign --sign "$IDENTITY" --force --options runtime \
-        --entitlements "$ENTITLEMENTS/token.plist" "$PERSISTENT_APPEX"
+    if [ -d "$PERSISTENT_APPEX" ]; then
+        codesign --sign "$IDENTITY" --force --options runtime \
+            --entitlements "$ENTITLEMENTS/token.plist" "$PERSISTENT_APPEX"
+    fi
     codesign --sign "$IDENTITY" --force --options runtime \
         --entitlements "$ENTITLEMENTS/app.plist" "$APP"
 fi
@@ -145,6 +153,10 @@ case "${1:-}" in
     --build)   echo "$APP" ;;
     --check)   exec "$BINARY" --check ;;
     --persistent)
+        if [ ! -d "$PERSISTENT_APPEX" ]; then
+            echo "tools/deskid_persistent_token.swift is missing from this checkout, so --persistent has nothing to install" >&2
+            exit 1
+        fi
         readonly TARGET="/Applications/DeskID Setup.app/Contents/PlugIns/DeskIDPersistent.appex"
         cp -R "$PERSISTENT_APPEX" "$TARGET"
         /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \

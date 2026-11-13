@@ -419,6 +419,13 @@ def run_sign(card: Card, report: Report) -> None:
             "signature verifies against the device certificate",
             verify_signature(certificate_from_object(certificate_object), digest, signature),
         )
+        # Gate outcome 1 is a match made inside this request. A stuck wake
+        # line once dated contact from the start of the wait, 27 s here.
+        fields = status_object(card)
+        if 0x0D in fields and status_number(fields, 0x0E) == 1:
+            report.check("match confirmed within 5 s of contact",
+                         status_number(fields, 0x0D) < 5000,
+                         f"{status_number(fields, 0x0D)} ms")
         if elapsed < 1.0:
             # A fast signature used to mean one thing. It now means two, and
             # only the board can say which: a touch given before the request
