@@ -29,7 +29,7 @@ The R503 has red and blue LEDs. The ring breathes blue while a request waits, tu
 
 ## Hardware
 
-The target is an [ESP32-S3 Super Mini](https://iotcrazy.com/docs/esp32-s3-m.html) board (`ESP32-S3FH4R2`, 4 MB flash, 22.5 × 18 mm), selected in PlatformIO as `lolin_s3_mini`. PSRAM is present and unused: credentials and USB buffers stay in internal RAM. The WS2812 RGB LED on GPIO 48 is unused. The R503 provides its own LEDs.
+The target is an [ESP32-S3 Super Mini](https://iotcrazy.com/docs/esp32-s3-m.html) board (`ESP32-S3FH4R2`, 4 MB flash, 22.5 × 18 mm), selected in PlatformIO as `lolin_s3_mini`. PSRAM is present and unused: credentials and USB buffers stay in internal RAM. The firmware switches the WS2812 RGB LED on GPIO 48 off at power-up and holds the pin low. The board's battery LED, next to the `BAT` mark, belongs to the charger and has no GPIO: on the bench board it blinks blue with no cell on `B+`/`B-`, and firmware cannot switch it off. The R503 provides its own LEDs.
 
 ### Fingerprint sensor wiring
 
