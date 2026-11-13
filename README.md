@@ -264,7 +264,9 @@ Four rules bound it:
 
 Each key is down for 30 ms and up for 30 ms (`kAutotypeReportMilliseconds`), about 0.4 s for the seven keys. `deskid::Autotype` holds the policy and `test/test_piv` tests it.
 
-Keys sent into a dark lock screen are lost. Armed with `02`, a match taps Left Shift and types nothing. The display wakes, the host sees a lit screen that is still locked and arms with `01`, and that arming types the digits 400 ms later (`kAutotypeLitMilliseconds`). The match waits 5 s for it (`kWokenMatchMilliseconds`). Zero seconds drops the match, so a Mac that something else unlocked in between gets no digits.
+Keys sent into a dark lock screen are lost. Armed with `02`, a match taps Left Shift and types nothing. The display wakes, the host sees a lit screen that is still locked and arms with `01`, and that arming types the digits 400 ms later (`kAutotypeLitMilliseconds`). The match waits 10 s for it (`kWokenMatchMilliseconds`). Zero seconds drops the match, so a Mac that something else unlocked in between gets no digits.
+
+A Mac that is fully asleep suspends the bus and runs no helper, so nothing arms the board. A match then signals remote wakeup, taps Left Shift once the bus resumes, and is held for the `01` arming the same way. The configuration descriptor sets the remote wakeup bit for this. A board whose wake line is not trusted does not watch its ring while the Mac sleeps and cannot wake it.
 
 What to expect from macOS:
 
@@ -281,7 +283,7 @@ Measured on 2026-11-13 on macOS 27.0.1, on a `deskid` board with an R503:
 
 - At the lock screen, with the card paired and a host process arming the board while the screen was locked and lit: one touch unlocked the Mac. The signature took 220 ms and the key agreement that followed took 201 ms.
 
-Not run yet: `sudo`, an unenrolled finger while armed, and the `02` request on a sleeping display. This repository has no helper that arms the board on its own, so `tools/deskid_arm.swift` is the trigger.
+Not run yet: `sudo`, an unenrolled finger while armed, the `02` request on a sleeping display, and waking a Mac that is asleep. This repository has no helper that arms the board on its own, so `tools/deskid_arm.swift` is the trigger.
 
 ### Guided setup
 

@@ -300,6 +300,10 @@ public:
     bool take(uint64_t nowMilliseconds);
     /// Whether the arming last taken was to wake.
     bool wakes() const;
+    /// A match that woke a sleeping host. Nothing can be in front of a Mac
+    /// that is asleep, so this needs no arming. The digits still wait for
+    /// the host to say its lock screen is lit.
+    void wokeHost(uint64_t nowMilliseconds);
     uint32_t emissions() const;
 
     /// The `index`-th eight-byte keyboard report of an emission.
@@ -315,9 +319,10 @@ private:
     bool toWake_ = false;
 };
 
-/// How long a match that woke the display waits for the host to say the lock
-/// screen is lit. Past it the touch is not typed for.
-constexpr uint32_t kWokenMatchMilliseconds = 5000;
+/// How long a match that woke the Mac waits for the host to say the lock
+/// screen is lit. A display lights in under a second and a Mac takes a few
+/// to come out of sleep. Past it the touch is not typed for.
+constexpr uint32_t kWokenMatchMilliseconds = 10000;
 
 // The R503's touch-sense output, as far as it can be believed.
 //

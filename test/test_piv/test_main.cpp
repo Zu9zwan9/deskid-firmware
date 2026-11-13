@@ -1365,6 +1365,25 @@ void test_autotype_forgets_a_woken_match_nobody_claimed() {
     TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
 }
 
+void test_autotype_types_for_a_match_that_woke_a_sleeping_host() {
+    deskid::Autotype autotype;
+    // Nobody armed the board: the host was asleep. The match woke it.
+    autotype.wokeHost(1000);
+    TEST_ASSERT_EQUAL_UINT32(0, autotype.emissions());
+    // The host is up, sees a lit lock screen and arms: that is the word.
+    TEST_ASSERT_TRUE(autotype.arm(10, 4000));
+    TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
+
+    // A Mac that woke unlocked never arms, and the match lapses.
+    autotype.wokeHost(20000);
+    TEST_ASSERT_FALSE(
+        autotype.arm(10, 20000 + deskid::kWokenMatchMilliseconds));
+    // One that disarms drops it at once.
+    autotype.wokeHost(40000);
+    autotype.arm(0, 41000);
+    TEST_ASSERT_FALSE(autotype.arm(10, 42000));
+}
+
 void test_autotype_wake_tap_is_left_shift_alone() {
     uint8_t report[8];
     std::memset(report, 0xAA, sizeof(report));
@@ -1482,6 +1501,7 @@ int main(int, char **) {
     RUN_TEST(test_autotype_fires_once_per_arming_and_only_inside_the_window);
     RUN_TEST(test_autotype_to_wake_taps_first_and_types_when_the_host_says_lit);
     RUN_TEST(test_autotype_forgets_a_woken_match_nobody_claimed);
+    RUN_TEST(test_autotype_types_for_a_match_that_woke_a_sleeping_host);
     RUN_TEST(test_autotype_wake_tap_is_left_shift_alone);
     RUN_TEST(test_autotype_presses_and_releases_keypad_digits_then_return);
     RUN_TEST(test_wake_line_is_believed_after_both_levels_and_reads_its_touched_level);

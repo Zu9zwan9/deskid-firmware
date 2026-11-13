@@ -153,8 +153,10 @@ constexpr uint16_t kConfigurationLength = 86 + 2 * TUD_HID_DESC_LEN;
 // each, which is how a YubiKey presents the same three functions. Four IN
 // endpoints with endpoint 0, one under what the ESP32-S3 can keep active.
 constexpr uint8_t kConfigurationDescriptor[] = {
+    // Bus powered, and allowed to wake a sleeping host: a touch has to be
+    // able to do what a key press on a keyboard does.
     9, TUSB_DESC_CONFIGURATION, U16_TO_U8S_LE(kConfigurationLength), 3, 1, 0,
-    0x80, 100,
+    0x80 | TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100,
     9, TUSB_DESC_INTERFACE, kInterfaceNumber, 0, 2, TUSB_CLASS_SMART_CARD, 0, 0, 4,
     0x36, TUSB_DESC_FUNCTIONAL,
     0x10, 0x01,
@@ -709,6 +711,10 @@ void publishAutotypeStatus(uint8_t secondsRemaining, uint32_t emissions,
     s_autotypeStatus.store(static_cast<uint8_t>(
         kStatusWakes | (watchesForFree ? kStatusWatchesForFree : 0)));
 }
+
+bool hostAsleep() { return tud_suspended(); }
+
+bool wakeHost() { return tud_suspended() && tud_remote_wakeup(); }
 
 bool sendKeyboardReport(const uint8_t report[8]) {
     // The endpoint is polled every 10 ms, so the previous report has gone
