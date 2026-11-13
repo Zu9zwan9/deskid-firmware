@@ -12,6 +12,8 @@
 #include "ccid_device.h"
 #include "deskid_core.h"
 #include "driver/gpio.h"
+#include "driver/rmt_encoder.h"
+#include "driver/rmt_tx.h"
 #include "driver/uart.h"
 #include "esp_check.h"
 #include "esp_efuse.h"
@@ -1545,7 +1547,56 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
 
 }  // namespace
 
+// The board's WS2812 hangs on GPIO48 and nothing drove that pin, so the LED
+// showed whatever its floating data line picked up. One all-zero frame
+// switches it off, and the pin is then held at the idle level so no noise
+// reaches it. The LED is decoration: a failure here is ignored.
+static void darkenBoardLed() {
+    constexpr gpio_num_t kPin = GPIO_NUM_48;
+    rmt_tx_channel_config_t channelConfig = {};
+    channelConfig.gpio_num = kPin;
+    channelConfig.clk_src = RMT_CLK_SRC_DEFAULT;
+    channelConfig.resolution_hz = 10000000;  // 0.1 us a tick
+    channelConfig.mem_block_symbols = 64;
+    channelConfig.trans_queue_depth = 1;
+
+    // WS2812B bit times: a zero is 0.3 us high and 0.9 us low, a one the
+    // reverse.
+    rmt_bytes_encoder_config_t encoderConfig = {};
+    encoderConfig.bit0.level0 = 1;
+    encoderConfig.bit0.duration0 = 3;
+    encoderConfig.bit0.level1 = 0;
+    encoderConfig.bit0.duration1 = 9;
+    encoderConfig.bit1.level0 = 1;
+    encoderConfig.bit1.duration0 = 9;
+    encoderConfig.bit1.level1 = 0;
+    encoderConfig.bit1.duration1 = 3;
+    encoderConfig.flags.msb_first = 1;
+
+    static constexpr uint8_t kOff[3] = {};
+    rmt_channel_handle_t channel = nullptr;
+    rmt_encoder_handle_t encoder = nullptr;
+    if (rmt_new_tx_channel(&channelConfig, &channel) == ESP_OK) {
+        if (rmt_new_bytes_encoder(&encoderConfig, &encoder) == ESP_OK &&
+            rmt_enable(channel) == ESP_OK) {
+            const rmt_transmit_config_t transmitConfig = {};
+            if (rmt_transmit(channel, encoder, kOff, sizeof(kOff),
+                             &transmitConfig) == ESP_OK) {
+                rmt_tx_wait_all_done(channel, 100);
+            }
+            rmt_disable(channel);
+        }
+        if (encoder != nullptr) {
+            rmt_del_encoder(encoder);
+        }
+        rmt_del_channel(channel);
+    }
+    gpio_set_level(kPin, 0);
+    gpio_set_direction(kPin, GPIO_MODE_OUTPUT);
+}
+
 extern "C" void app_main() {
+    darkenBoardLed();
 #if defined(DESKID_PRODUCTION)
     ESP_ERROR_CHECK(esp_efuse_is_flash_encryption_enabled()
                         ? ESP_OK
