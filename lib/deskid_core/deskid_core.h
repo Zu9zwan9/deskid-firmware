@@ -52,6 +52,13 @@ constexpr uint8_t kArmOnSelectSeconds = 20;
 /// process asks first, hours later.
 constexpr uint64_t kVerifiedValidMilliseconds = 30000;
 
+/// A login is a signature and then a key agreement: macOS proves the card with
+/// slot 9A and unwraps the keychain password with slot 9D. The touch that
+/// pays for the first buys this many of the second, for this long. Asking for
+/// a touch each would make every unlock two touches.
+constexpr uint8_t kAgreementsPerTouch = 1;
+constexpr uint64_t kAgreementValidMilliseconds = 10000;
+
 struct DeviceStatus {
     const char *firmwareVersion = "";
     uint8_t buildVariant = 0;
@@ -161,6 +168,12 @@ private:
     bool selected_ = false;
     bool verified_ = false;
     uint64_t verifiedAtMilliseconds_ = 0;
+    // Not cleared by SELECT or a card reset, unlike verified_: the two halves
+    // of a login may reach the card through different sessions. The count
+    // and the clock are the whole bound.
+    uint8_t agreementsLeft_ = 0;
+    uint64_t agreementsUntilMilliseconds_ = 0;
+    void grantAgreements();
 };
 
 class RateLimiter {
