@@ -1137,11 +1137,23 @@ public:
         templateCount_ = 0;
         templateCountKnown_ = true;
         enrollStage_ = 0;
+        enrollRingSeenEmpty_ = false;
         return true;
     }
 
     uint8_t enrollStep() {
         if (enrollStage_ == 0) {
+            // The first image has to come from a touch that began for it. The
+            // finger that authorized this enrollment is still on the ring
+            // when the first step runs, and capturing it would enroll the
+            // finger the sensor already has.
+            if (!enrollRingSeenEmpty_) {
+                if (fingerPresent()) {
+                    return 4;
+                }
+                enrollRingSeenEmpty_ = true;
+                showWaiting();
+            }
             const uint8_t confirmation = captureInto(0x01);
             if (confirmation == 0x02) {
                 return 0;
@@ -1187,6 +1199,7 @@ public:
             return abortEnrollment();
         }
         enrollStage_ = 0;
+        enrollRingSeenEmpty_ = false;
         refreshTemplateCount();
         showSuccess();
         return 3;
@@ -1397,6 +1410,7 @@ private:
 
     uint8_t abortEnrollment() {
         enrollStage_ = 0;
+        enrollRingSeenEmpty_ = false;
         showFailure();
         return 0xFF;
     }
@@ -1429,6 +1443,7 @@ private:
     uint16_t templateCount_ = 0;
     bool templateCountKnown_ = false;
     uint8_t enrollStage_ = 0;
+    bool enrollRingSeenEmpty_ = false;
 };
 
 // Finger-on to match-confirmed for the last successful authentication, the
@@ -1979,6 +1994,12 @@ extern "C" void app_main() {
                 sensor.recover();
             }
             sensor.observeWakeLine();
+            if (applet.enrollmentOpen()) {
+                // The ring belongs to the enrollment. The finger on it is
+                // new, and matching it would spend attempts on a finger that
+                // cannot match yet.
+                continue;
+            }
             if (sensor.wakeLineUsable()) {
                 scanForEarlyTouch(sensor, presenceLimiter, attempts);
             } else if (ringArmed() && now >= nextArmedScan) {
