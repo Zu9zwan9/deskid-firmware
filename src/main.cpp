@@ -107,10 +107,12 @@ constexpr uint8_t kMaximumArmSeconds = 120;
 constexpr uint8_t kFingerprintSecurityLevel = 3;
 // A held finger gets several captures before it has to lift, the way Touch ID
 // keeps trying: partial contact and a smeared first image are the normal case,
-// not an attack. Every rejected *match* still counts against the rate limiter.
-// Shared by the gated wait and the idle scan — a single-shot idle match
-// rejects ordinary touches that the gated path would have accepted.
-constexpr int kRetriesPerTouch = 3;
+// not an attack. A rejected *touch* counts once against the rate limiter,
+// however many of its images were rejected: deskid::AttemptLedger enforces
+// both that and this limit. Shared by the gated wait and the idle scan — a
+// single-shot idle match rejects ordinary touches that the gated path would
+// have accepted.
+constexpr int kRetriesPerTouch = deskid::kVerdictsPerTouch;
 constexpr uint32_t kFingerprintFailureThreshold = 5;
 constexpr uint64_t kFingerprintBaseLockoutMilliseconds = 15000;
 constexpr uint64_t kFingerprintMaximumLockoutMilliseconds = 900000;
@@ -816,8 +818,9 @@ public:
 
         // Search is the verdict, so the attempt is charged and written down
         // before it is sent: see deskid::AttemptLedger. Nothing above this
-        // line tells an attacker anything, and nothing below it is free.
-        if (!ledger.charge(millisecondsSinceBoot())) {
+        // line tells an attacker anything, and nothing below it is free. The
+        // charge is one a touch: later images of the same touch ride on it.
+        if (!ledger.chargeTouch(millisecondsSinceBoot())) {
             return MatchResult::sensorError;
         }
 
@@ -1355,6 +1358,7 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
     const bool present = sensor.wakeLineUsable() ? sensor.wakeLineTouched()
                                                  : sensor.fingerPresent();
     if (!present) {
+        ledger.touchEnded();
         g_idleWaitForRemoval = false;
         g_idleTouchStartedAtUs = 0;
         g_idleRetriesThisTouch = 0;
@@ -1395,7 +1399,7 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
             g_idleWaitForRemoval = true;
             return;
         case R503Sensor::MatchResult::notMatched:
-            // Already charged and written down, before the verdict.
+            // Charged and written down before the touch's first verdict.
             if (!limiter.locked(millisecondsSinceBoot()) &&
                 ++g_idleRetriesThisTouch < kRetriesPerTouch) {
                 return;  // still the same finger; try the next image
@@ -1478,6 +1482,7 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
         }
 
         if (!sensor.fingerPresent()) {
+            ledger.touchEnded();
             fingerSeenAt = 0;
             retriesThisTouch = 0;
             if (waitForFingerRemoval) {
@@ -1514,7 +1519,7 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
                 g_idleWaitForRemoval = true;
                 return true;
             case R503Sensor::MatchResult::notMatched:
-                // Already charged and written down, before the verdict.
+                // Charged and written down before the touch's first verdict.
                 if (limiter.locked(millisecondsSinceBoot())) {
                     sensor.showFailure();
                     sensor.turnLedOff();

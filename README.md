@@ -192,7 +192,7 @@ Touch the sensor, lift when told, then touch the same finger again. Each `80 E1 
 
 While the library is empty, enrollment needs no authorization. An empty sensor cannot produce a match, so a gate would make the first finger impossible to enroll. Empty means the sensor has reported zero templates. A count the sensor has not reported is treated as a full library. Once one template exists, `80 E1` is user-presence gated like `0x47`, `0xDB` and `80 F0`: a new finger requires an existing one. `80 E2` empties the library and needs a match too.
 
-Press flat and hold for a second. A held finger gets three match attempts and six capture attempts before the firmware asks for it to lift (`kRetriesPerTouch` in `src/main.cpp`). A red flash means the finger has used its attempts: lift and try again. Each rejected match counts toward the five-failure lockout. If the status object shows `consecutive failed matches: 0` after a timeout, no image passed quality and no match was attempted. Press flatter.
+Press flat and hold for a second. A held finger gets three match attempts and six capture attempts before the firmware asks for it to lift (`kRetriesPerTouch` in `src/main.cpp`). A red flash means the finger has used its attempts: lift and try again. A rejected touch counts once toward the five-failure lockout, however many of its images were rejected. If the status object shows `consecutive failed matches: 0` after a timeout, no image passed quality and no match was attempted. Press flatter.
 
 ### Production image
 
@@ -236,7 +236,7 @@ Three rules bound the window:
 - Login only. `VERIFY` and `GENERAL AUTHENTICATE` may spend it. Enrolling a finger, writing a key or certificate, emptying the sensor and rebooting into download mode each need a live match while the host waits. `deskid::EarlyTouch::maySpend` enforces this and `test/test_piv` tests it.
 - 30 s, the time a request waits for a finger. A first value of 15 s covered a deliberate touch, click, digits and Return, and failed at a normal pace. The constant is `kEarlyTouchValidMilliseconds` in `src/main.cpp`, and `Device.earlyTouchWindow` in the setup app must match it.
 
-A rejected idle touch costs up to three rate-limiter attempts. The ring then stops looking until the finger lifts, so an object resting on the sensor cannot run the device into a lockout.
+A rejected idle touch costs one rate-limiter attempt. The ring then stops looking until the finger lifts, so an object resting on the sensor cannot run the device into a lockout.
 
 The idle scan needs the blue wire. `WAKEUP` on `GPIO4` makes each idle poll a GPIO read at about 5 µA, and the firmware answers contact within 40 ms. The UART fallback is `GenImg`, and running it without a limit power-cycles the board (see [Fingerprint sensor wiring](#fingerprint-sensor-wiring)). Without a usable wake line the board scans with `GenImg` inside a bounded window: 20 s after the host selects the card, or up to 120 s after `80 E3`. `hw_smoke_test.py --status` reports `wake line (GPIO4)`: `high` with the ring empty and `low` under a finger means the wire is good.
 
