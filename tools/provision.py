@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives.serialization import (
     Encoding,
     NoEncryption,
     PrivateFormat,
+    PublicFormat,
     load_der_private_key,
     load_pem_private_key,
 )
@@ -31,6 +32,8 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID, ObjectIdentifier
 SMART_CARD_LOGON_OID = ObjectIdentifier("1.3.6.1.4.1.311.20.2.2")
 CERTIFICATE_TAG = bytes.fromhex("5FC105")
 GENERATE_KEY_9A = bytes.fromhex("0047009A05AC0380011100")
+KEY_MANAGEMENT_CERTIFICATE_TAG = bytes.fromhex("5FC10B")
+GENERATE_KEY_9D = bytes.fromhex("0047009D05AC0380011100")
 AUTHORITY_DAYS = 3650
 CERTIFICATE_DAYS = 825
 
@@ -64,6 +67,12 @@ def parse_arguments() -> argparse.Namespace:
         "--create-ca",
         action="store_true",
         help="Create the self-signed issuing authority before provisioning.",
+    )
+    parser.add_argument(
+        "--key-management",
+        action="store_true",
+        help="Add the slot 9D key and its certificate to a board that already "
+        "has its identity. Slot 9A is not touched, so a paired Mac stays paired.",
     )
     parser.add_argument(
         "--common-name",
@@ -160,13 +169,8 @@ def certificate_object(certificate_der: bytes) -> bytes:
     return b"\x53" + encode_length(len(content)) + content
 
 
-def put_data_apdu(stored_object: bytes) -> bytes:
-    body = (
-        b"\x5c"
-        + encode_length(len(CERTIFICATE_TAG))
-        + CERTIFICATE_TAG
-        + stored_object
-    )
+def put_data_apdu(stored_object: bytes, tag: bytes = CERTIFICATE_TAG) -> bytes:
+    body = b"\x5c" + encode_length(len(tag)) + tag + stored_object
     return (
         bytes([0x00, 0xDB, 0x3F, 0xFF, 0x00, len(body) >> 8, len(body) & 0xFF]) + body
     )
@@ -223,9 +227,11 @@ def issue_certificate(
     authority: x509.Certificate,
     authority_key: ec.EllipticCurvePrivateKey,
     common_name: str,
+    key_agreement: bool = False,
 ) -> x509.Certificate:
+    """The identity certificate signs; the key management one only agrees keys."""
     now = datetime.now(timezone.utc)
-    return (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(
             x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
@@ -240,11 +246,11 @@ def issue_certificate(
         )
         .add_extension(
             x509.KeyUsage(
-                digital_signature=True,
+                digital_signature=not key_agreement,
                 content_commitment=False,
                 key_encipherment=False,
                 data_encipherment=False,
-                key_agreement=False,
+                key_agreement=key_agreement,
                 key_cert_sign=False,
                 crl_sign=False,
                 encipher_only=False,
@@ -253,20 +259,89 @@ def issue_certificate(
             critical=True,
         )
         .add_extension(
-            x509.ExtendedKeyUsage(
-                [ExtendedKeyUsageOID.CLIENT_AUTH, SMART_CARD_LOGON_OID]
-            ),
-            critical=False,
-        )
-        .add_extension(
             x509.SubjectKeyIdentifier.from_public_key(public_key), critical=False
         )
         .add_extension(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(authority.public_key()),
             critical=False,
         )
-        .sign(authority_key, hashes.SHA256())
     )
+    if not key_agreement:
+        builder = builder.add_extension(
+            x509.ExtendedKeyUsage(
+                [ExtendedKeyUsageOID.CLIENT_AUTH, SMART_CARD_LOGON_OID]
+            ),
+            critical=False,
+        )
+    return builder.sign(authority_key, hashes.SHA256())
+
+
+def provision_key_management(card, smoke, authority, authority_key, hint):
+    """Slot 9D for a board that has its identity: key, certificate, proof.
+
+    macOS wraps the login keychain password to this key when the card is
+    paired, and without it asks for that password at every smart card unlock.
+    """
+    stored, status, _ = smoke.get_data(card, CERTIFICATE_TAG)
+    der = (
+        smoke.read_tlv(smoke.read_tlv(stored).get(0x53, b"")).get(0x70, b"")
+        if status == smoke.SW_OK
+        else b""
+    )
+    if not der:
+        raise ValueError("the board has no identity certificate — provision it first")
+    identity = x509.load_der_x509_certificate(der)
+    try:
+        authority.public_key().verify(
+            identity.signature,
+            identity.tbs_certificate_bytes,
+            ec.ECDSA(identity.signature_hash_algorithm),
+        )
+    except InvalidSignature as error:
+        raise ValueError(
+            "this authority did not issue the board's identity certificate"
+        ) from error
+    common_name = identity.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+
+    hint("generating the key management key")
+    data, status, elapsed = card.send(GENERATE_KEY_9D)
+    if status != smoke.SW_OK:
+        raise ValueError(f"GENERATE ASYMMETRIC KEY PAIR failed with SW {status:04X}")
+    point = smoke.read_tlv(smoke.read_tlv(data[1:]).get(0x49, b"")).get(0x86, b"")
+    if len(point) != 65:
+        raise ValueError(f"unexpected key generation response: {data.hex().upper()}")
+    public_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), point)
+    print(f"device generated a P-256 key management key in {elapsed:.1f} s")
+
+    certificate = issue_certificate(
+        public_key, authority, authority_key, common_name, key_agreement=True
+    )
+    stored_object = certificate_object(certificate.public_bytes(Encoding.DER))
+    hint("storing the certificate")
+    _, status, _ = card.send(put_data_apdu(stored_object, KEY_MANAGEMENT_CERTIFICATE_TAG))
+    if status != smoke.SW_OK:
+        raise ValueError(f"PUT DATA failed with SW {status:04X}")
+    read_back, status, _ = smoke.get_data(card, KEY_MANAGEMENT_CERTIFICATE_TAG)
+    if status != smoke.SW_OK or read_back != stored_object:
+        raise ValueError("the certificate read back from the device differs")
+
+    # The board and this host each derive the secret; equal secrets mean the
+    # private half of the certified key is on the board.
+    ephemeral = ec.generate_private_key(ec.SECP256R1())
+    body = bytes([0x7C, 0x45, 0x82, 0x00, 0x85, 0x41]) + ephemeral.public_key().public_bytes(
+        Encoding.X962, PublicFormat.UncompressedPoint
+    )
+    hint("proving the key is on-device")
+    data, status, elapsed = card.send(
+        bytes([0x00, 0x87, 0x11, 0x9D, len(body)]) + body + b"\x00"
+    )
+    if status != smoke.SW_OK:
+        raise ValueError(f"GENERAL AUTHENTICATE failed with SW {status:04X}")
+    secret = smoke.read_tlv(smoke.read_tlv(data).get(0x7C, b"")).get(0x82, b"")
+    if secret != ephemeral.exchange(ec.ECDH(), public_key):
+        raise ValueError("the device's shared secret does not match the issued certificate")
+    print(f"device agreed a key with a random peer in {elapsed:.1f} s")
+    return certificate
 
 
 def provision_on_device(arguments: argparse.Namespace) -> int:
@@ -323,6 +398,17 @@ def provision_on_device(arguments: argparse.Namespace) -> int:
             def hint(action: str) -> None:
                 if gated:
                     print(f"touch the sensor if one is attached — {action}")
+
+            if arguments.key_management:
+                certificate = provision_key_management(
+                    card, smoke, authority, authority_key, hint
+                )
+                certificate_path = (
+                    arguments.output_directory / "deskid-key-management.crt"
+                )
+                certificate_path.write_bytes(certificate.public_bytes(Encoding.PEM))
+                print(f"key management certificate: {certificate_path}")
+                return 0
 
             hint("generating the device key")
             data, status, elapsed = card.send(GENERATE_KEY_9A)
