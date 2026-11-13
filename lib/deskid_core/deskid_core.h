@@ -323,20 +323,40 @@ public:
     /// Reports in one emission: a press and a release for each key.
     static constexpr size_t kReportCount = 14;
 
-    /// Zero seconds disarms.
-    void arm(uint8_t seconds, uint64_t nowMilliseconds);
+    /// Zero seconds disarms, and forgets a match that is waiting for a lit
+    /// screen.
+    ///
+    /// `toWake` is the host saying the display is asleep. Keys sent into a
+    /// dark lock screen are lost, so a match under such an arming taps the
+    /// wake key and waits. The host's next ordinary arming says the lock
+    /// screen is lit and still locked, and this returns true: the caller
+    /// types. The board never guesses how long a display takes to wake, and
+    /// a Mac that something else unlocked meanwhile gets no digits.
+    bool arm(uint8_t seconds, uint64_t nowMilliseconds, bool toWake = false);
     uint8_t secondsRemaining(uint64_t nowMilliseconds) const;
-    /// True once per arming, inside its window. The caller then types.
+    /// True once per arming, inside its window. The caller then types, or
+    /// taps the wake key when wakes() says so.
     bool take(uint64_t nowMilliseconds);
+    /// Whether the arming last taken was to wake.
+    bool wakes() const;
     uint32_t emissions() const;
 
     /// The `index`-th eight-byte keyboard report of an emission.
     static void report(size_t index, uint8_t report[8]);
+    /// The wake tap: Left Shift alone, which wakes a display and types
+    /// nothing if the field is already there.
+    static void wakeReport(bool pressed, uint8_t report[8]);
 
 private:
     uint64_t armedUntilMilliseconds_ = 0;
+    uint64_t wokenUntilMilliseconds_ = 0;
     uint32_t emissions_ = 0;
+    bool toWake_ = false;
 };
+
+/// How long a match that woke the display waits for the host to say the lock
+/// screen is lit. Past it the touch is not typed for.
+constexpr uint32_t kWokenMatchMilliseconds = 5000;
 
 // The R503's touch-sense output, as far as it can be believed.
 //

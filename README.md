@@ -282,7 +282,7 @@ The board presents three USB interfaces: the CCID reader, a keyboard, and a vend
 swift tools/deskid_arm.swift 10   # arm for 10 s, then touch the ring
 ```
 
-Arming is a feature report on the vendor interface (usage page `0xFF00`, usage `1`, no report ID): `01`, then the seconds. Reading the report back returns `01`, the seconds the arming has left and the number of emissions since power-up.
+Arming is a feature report on the vendor interface (usage page `0xFF00`, usage `1`, no report ID): `01`, then the seconds. `02`, then the seconds, is the same request for a display that is asleep. Reading the report back returns `01`, the seconds the arming has left, the number of emissions since power-up and a status byte. Bit 0 of the status is set when the board understands `02`. Bit 1 is set when the wake line is trusted, so watching the ring costs no image captures and a host may keep the board armed.
 
 Four rules bound it:
 
@@ -292,6 +292,8 @@ Four rules bound it:
 - Development builds only. `DESKID_ALLOW_AUTOTYPE` is set for `env:deskid`. Arming carries no authentication yet, so any local process can ask the board to type its constant after your next touch. A production image ignores the request.
 
 Each key is down for 30 ms and up for 30 ms (`kAutotypeReportMilliseconds`), about 0.4 s for the seven keys. `deskid::Autotype` holds the policy and `test/test_piv` tests it.
+
+Keys sent into a dark lock screen are lost. Armed with `02`, a match taps Left Shift and types nothing. The display wakes, the host sees a lit screen that is still locked and arms with `01`, and that arming types the digits 400 ms later (`kAutotypeLitMilliseconds`). The match waits 5 s for it (`kWokenMatchMilliseconds`). Zero seconds drops the match, so a Mac that something else unlocked in between gets no digits.
 
 What to expect from macOS:
 
@@ -306,7 +308,9 @@ Measured on 2026-11-13 on macOS 27.0.1, on a `deskid` board with an R503:
 - Not armed: a touch matched and typed nothing.
 - The arming interface opened from a shell with no Input Monitoring request, and Keyboard Setup Assistant did not open.
 
-Not run yet: the lock screen, `sudo`, and an unenrolled finger while armed. No helper arms the board on its own, so `tools/deskid_arm.swift` is the trigger.
+- At the lock screen, with the card paired and a host process arming the board while the screen was locked and lit: one touch unlocked the Mac. The signature took 220 ms and the key agreement that followed took 201 ms.
+
+Not run yet: `sudo`, an unenrolled finger while armed, and the `02` request on a sleeping display. This repository has no helper that arms the board on its own, so `tools/deskid_arm.swift` is the trigger.
 
 ### Guided setup
 

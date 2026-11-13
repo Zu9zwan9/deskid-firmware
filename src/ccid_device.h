@@ -36,9 +36,12 @@ uint32_t ccidSecureRequests();
 
 /// True when a host has sent an arming request since the last call. The USB
 /// task receives it and the main task acts on it.
-bool takeAutotypeArm(uint8_t &seconds);
+bool takeAutotypeArm(uint8_t &seconds, bool &toWake);
 /// What the arming interface answers when a host reads it back.
-void publishAutotypeStatus(uint8_t secondsRemaining, uint32_t emissions);
+/// `watchesForFree` is the wake line being trusted: a host may then keep the
+/// board armed for as long as it likes, because watching costs no captures.
+void publishAutotypeStatus(uint8_t secondsRemaining, uint32_t emissions,
+                           bool watchesForFree);
 /// Sends one eight-byte keyboard report. False when the host is not taking
 /// them: suspended, not configured, or the interface refused.
 bool sendKeyboardReport(const uint8_t report[8]);
