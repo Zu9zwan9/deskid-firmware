@@ -145,7 +145,9 @@ public:
         return value;
     }
 
-    uint64_t uptimeMilliseconds() const override { return nowMilliseconds; }
+    uint64_t uptimeMilliseconds() const override {
+        return epochMilliseconds + nowMilliseconds;
+    }
 
     bool enterDownloadMode() override {
         ++downloadModeRequests;
@@ -182,6 +184,9 @@ public:
     uint32_t enrolledTemplates = 2;
     bool templateCountKnown = true;
     uint64_t nowMilliseconds = 0;
+    // A board's clock never restarts. setUp() moves this on an hour, so what
+    // one test left time-bound in the applet has run out before the next.
+    uint64_t epochMilliseconds = 0;
     const char *firmwareVersion = "9.9.9";
     bool signingSelfTestPassed = true;
 };
@@ -239,6 +244,7 @@ void setUp() {
     diagnostics.enrolledTemplates = 2;
     diagnostics.templateCountKnown = true;
     diagnostics.nowMilliseconds = 0;
+    diagnostics.epochMilliseconds += 3600000;
     diagnostics.firmwareVersion = "9.9.9";
     diagnostics.signingSelfTestPassed = true;
     response.fill(0);
@@ -1073,26 +1079,85 @@ void test_key_agreement_waits_for_a_fingerprint_and_returns_the_secret() {
     TEST_ASSERT_EQUAL_HEX8(0x00, response[37]);
 }
 
-// One verified touch is one private-key operation, whichever slot spends it.
-void test_key_agreement_spends_a_verified_touch_exactly_once() {
+// A login is a signature and a key agreement: macOS proves the card with the
+// first and unwraps the keychain password with the second. One touch buys
+// that pair and no more of either.
+void test_one_touch_buys_one_signature_and_one_key_agreement() {
     selectApplet();
+    diagnostics.nowMilliseconds = 1000;
     constexpr uint8_t verify[] = {
         0x00, 0x20, 0x00, 0x80, 0x08, 0xFF, 0xFF,
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
     };
-    const auto request = keyAgreementRequest();
+    std::array<uint8_t, 44> sign = {
+        0x00, 0x87, 0x11, 0x9A, 0x26, 0x7C, 0x24, 0x82, 0x00, 0x81, 0x20,
+    };
+    const auto agree = keyAgreementRequest();
+    size_t responseLength = 0;
+    auto send = [&](const uint8_t *apdu, size_t length, bool userPresent) {
+        return applet.transceive(apdu, length, userPresent, response.data(),
+                                 response.size(), responseLength);
+    };
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      send(verify, sizeof(verify), true));
+
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      send(agree.data(), agree.size(), false));
+    TEST_ASSERT_EQUAL_HEX8(0x7C, response[0]);
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      send(agree.data(), agree.size(), false));
+
+    // The agreement did not spend the signature.
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      send(sign.data(), sign.size(), false));
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      send(sign.data(), sign.size(), false));
+}
+
+// The driver asks for the signature with no VERIFY before it. The touch that
+// paid for the signature covers the agreement of the same login.
+void test_a_touch_spent_on_a_signature_covers_the_key_agreement_after_it() {
+    selectApplet();
+    diagnostics.nowMilliseconds = 1000;
+    std::array<uint8_t, 44> sign = {
+        0x00, 0x87, 0x11, 0x9A, 0x26, 0x7C, 0x24, 0x82, 0x00, 0x81, 0x20,
+    };
+    const auto agree = keyAgreementRequest();
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(sign.data(), sign.size(), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+    // The two halves may come through different card sessions.
+    applet.reset();
+    selectApplet();
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(agree.data(), agree.size(), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(agree.data(), agree.size(), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+}
+
+// The pair is a login in progress, not a standing permission.
+void test_the_key_agreement_a_touch_bought_expires_with_it() {
+    selectApplet();
+    diagnostics.nowMilliseconds = 1000;
+    constexpr uint8_t verify[] = {
+        0x00, 0x20, 0x00, 0x80, 0x08, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+    const auto agree = keyAgreementRequest();
     size_t responseLength = 0;
     TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
                       applet.transceive(verify, sizeof(verify), true,
                                         response.data(), response.size(),
                                         responseLength));
-    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
-                      applet.transceive(request.data(), request.size(), false,
-                                        response.data(), response.size(),
-                                        responseLength));
-    TEST_ASSERT_EQUAL_HEX8(0x7C, response[0]);
+    diagnostics.nowMilliseconds = 1000 + deskid::kAgreementValidMilliseconds;
     TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
-                      applet.transceive(request.data(), request.size(), false,
+                      applet.transceive(agree.data(), agree.size(), false,
                                         response.data(), response.size(),
                                         responseLength));
 }
@@ -1419,7 +1484,9 @@ int main(int, char **) {
     RUN_TEST(test_verify_expires_instead_of_waiting_for_a_signature);
     RUN_TEST(test_status_object_fits_the_longest_version_string);
     RUN_TEST(test_key_agreement_waits_for_a_fingerprint_and_returns_the_secret);
-    RUN_TEST(test_key_agreement_spends_a_verified_touch_exactly_once);
+    RUN_TEST(test_one_touch_buys_one_signature_and_one_key_agreement);
+    RUN_TEST(test_a_touch_spent_on_a_signature_covers_the_key_agreement_after_it);
+    RUN_TEST(test_the_key_agreement_a_touch_bought_expires_with_it);
     RUN_TEST(test_key_agreement_rejects_malformed_templates_without_waiting);
     RUN_TEST(test_key_agreement_is_refused_without_a_key_management_identity);
     RUN_TEST(test_key_management_slot_generates_its_own_key_behind_the_gate);
