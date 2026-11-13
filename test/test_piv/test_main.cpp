@@ -896,6 +896,47 @@ void test_a_match_clears_the_charge_and_says_so_on_disk() {
     TEST_ASSERT_EQUAL_UINT32(0, store.lockouts);
 }
 
+// A resting finger is imaged up to three times, because the first image is
+// often smeared. Charging each image made one touch cost three of the five
+// attempts, and two imperfect touches locked a board out in eight seconds.
+// One touch is one attempt.
+void test_one_touch_is_one_charge_for_at_most_three_verdicts() {
+    FakeLimiterStore store;
+    deskid::RateLimiter limiter(3, 1000, 4000);
+    deskid::AttemptLedger ledger(limiter, store);
+
+    TEST_ASSERT_TRUE(ledger.chargeTouch(0));
+    TEST_ASSERT_TRUE(ledger.chargeTouch(0));
+    TEST_ASSERT_TRUE(ledger.chargeTouch(0));
+    TEST_ASSERT_EQUAL_UINT32(1, store.failures);
+    TEST_ASSERT_EQUAL_UINT32(1, store.writes);
+    // A fourth image of the same touch is not put to the sensor at all.
+    TEST_ASSERT_FALSE(ledger.chargeTouch(0));
+
+    ledger.touchEnded();
+    TEST_ASSERT_TRUE(ledger.chargeTouch(0));
+    TEST_ASSERT_EQUAL_UINT32(2, store.failures);
+}
+
+// The charge that arms the lockout still gets its own verdict, as charge()
+// allows, but no further image of that touch. A match frees the finger to be
+// asked about again, at the price of a new charge.
+void test_a_touch_stops_riding_once_locked_out_and_a_match_starts_over() {
+    FakeLimiterStore store;
+    deskid::RateLimiter limiter(2, 1000, 4000);
+    deskid::AttemptLedger ledger(limiter, store);
+
+    TEST_ASSERT_TRUE(ledger.chargeTouch(0));
+    ledger.touchEnded();
+    TEST_ASSERT_TRUE(ledger.chargeTouch(0));
+    TEST_ASSERT_TRUE(limiter.locked(0));
+    TEST_ASSERT_FALSE(ledger.chargeTouch(0));
+
+    ledger.matched();
+    TEST_ASSERT_TRUE(ledger.chargeTouch(0));
+    TEST_ASSERT_EQUAL_UINT32(1, store.failures);
+}
+
 void test_an_attempt_that_cannot_be_written_down_is_refused() {
     FakeLimiterStore store;
     store.healthy = false;
@@ -1046,6 +1087,8 @@ int main(int, char **) {
     RUN_TEST(test_early_touch_is_single_use_and_expires);
     RUN_TEST(test_attempt_is_charged_before_the_verdict_and_survives_power_loss);
     RUN_TEST(test_a_match_clears_the_charge_and_says_so_on_disk);
+    RUN_TEST(test_one_touch_is_one_charge_for_at_most_three_verdicts);
+    RUN_TEST(test_a_touch_stops_riding_once_locked_out_and_a_match_starts_over);
     RUN_TEST(test_an_attempt_that_cannot_be_written_down_is_refused);
     RUN_TEST(test_enrollment_is_gated_while_the_template_count_is_unknown);
     RUN_TEST(test_verify_expires_instead_of_waiting_for_a_signature);
