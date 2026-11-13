@@ -42,7 +42,7 @@ The R503 ships with an MX1.0-6P pigtail. Pin 1 is the red wire. Wire by the prin
 | 2 | black | `GND` | pad marked `GND` | n/a | Ground |
 | 3 | yellow | `TXD` | upper unlabelled left pad | `GPIO43` | Sensor to ESP32 |
 | 4 | green | `RXD` | lower unlabelled left pad | `GPIO44` | ESP32 to sensor |
-| 5 | blue | `WAKEUP` | pad marked `4` | `GPIO4` | Sensor to ESP32, active high |
+| 5 | blue | `WAKEUP` | pad marked `4` | `GPIO4` | Sensor to ESP32, low while touched |
 | 6 | white | `3.3VT` | pad marked `3V3` | n/a | Touch-sense supply, ~5 µA |
 
 Both edges as printed, USB-C at the top and the module facing you:
@@ -70,7 +70,7 @@ The two UART pads carry contradictory silkscreens. The front reads `RX` next to 
 
 DeskID runs the sensor on `UART_NUM_1` at 57600 baud, 8N1, no flow control, with `GPIO44` as its transmitter and `GPIO43` as its receiver.
 
-Solder the blue wire. `GPIO4` is an input with the internal pull-down enabled, and the R503 drives `WAKEUP` high on touch for about 5 µA. During an authentication the wire saves one UART round trip per poll: `GenImg` answers `0x02` when the ring is untouched, so `R503Sensor::fingerPresent` can fall back to a UART probe. Between authentications [Touch first](#touch-first) has to watch the ring all the time, and `GenImg` is a full image capture that powers the imaging array and the illumination LED. Four captures a second browned the 3V3 rail out, power-cycled the board and left the sensor unauthenticated (measured 2026-09-02). The idle scan therefore watches `WAKEUP` alone.
+Solder the blue wire. `GPIO4` is an input with the internal pull-up enabled. The R503 holds `WAKEUP` high while the ring is empty and drives it low for as long as a finger rests there, on about 5 µA of touch-sense supply. Measured on 2026-11-13 at ten samples a second: `driven high` at rest, `driven low` through two touches of 2.4 s and 3.7 s. Earlier firmware read the line the other way round and took an empty ring for a finger. A sensor with the opposite sense builds with `-DDESKID_WAKE_TOUCHED_LEVEL=1`. During an authentication the wire saves one UART round trip per poll: `GenImg` answers `0x02` when the ring is untouched, so `R503Sensor::fingerPresent` can fall back to a UART probe. Between authentications [Touch first](#touch-first) has to watch the ring all the time, and `GenImg` is a full image capture that powers the imaging array and the illumination LED. Four captures a second browned the 3V3 rail out, power-cycled the board and left the sensor unauthenticated (measured 2026-09-02). The idle scan therefore watches `WAKEUP` alone.
 
 Without the blue wire the card still enrolls and signs. The ring stays dark until the host selects the card or sends a request.
 
@@ -240,7 +240,7 @@ Three rules bound the window:
 
 A rejected idle touch costs up to three rate-limiter attempts. The ring then stops looking until the finger lifts, so an object resting on the sensor cannot run the device into a lockout.
 
-The idle scan needs the blue wire. `WAKEUP` on `GPIO4` makes each idle poll a GPIO read at about 5 µA, and the firmware answers contact within 40 ms. The UART fallback is `GenImg`, and running it without a limit power-cycles the board (see [Fingerprint sensor wiring](#fingerprint-sensor-wiring)). Without a usable wake line the board scans with `GenImg` inside a bounded window: 20 s after the host selects the card, or up to 120 s after `80 E3`. `hw_smoke_test.py --status` reports `wake line (GPIO4)`. Touch the sensor and run it: `high` means the wire is good.
+The idle scan needs the blue wire. `WAKEUP` on `GPIO4` makes each idle poll a GPIO read at about 5 µA, and the firmware answers contact within 40 ms. The UART fallback is `GenImg`, and running it without a limit power-cycles the board (see [Fingerprint sensor wiring](#fingerprint-sensor-wiring)). Without a usable wake line the board scans with `GenImg` inside a bounded window: 20 s after the host selects the card, or up to 120 s after `80 E3`. `hw_smoke_test.py --status` reports `wake line (GPIO4)`: `high` with the ring empty and `low` under a finger means the wire is good.
 
 ### Touch only
 
@@ -367,7 +367,7 @@ python3 tools/hw_smoke_test.py --status
 
 The build variant matters: a `deskid-bringup` unit approves each presence request.
 
-The wake line field checks the blue wire. Touch the sensor and run `--status`: `high` means the wire is good. `low` means the idle scan in [Touch first](#touch-first) will not run. During an authentication the firmware falls back to a UART probe and loses a little latency.
+The wake line field checks the blue wire. Run `--status` with the ring empty and again with a finger on it: `high` then `low` means the wire is good. A level that never changes means the idle scan in [Touch first](#touch-first) will not run, because the firmware trusts the line only after it has seen both levels. During an authentication the firmware falls back to a UART probe and loses a little latency.
 
 The same channel reboots the board into download mode without a button press:
 

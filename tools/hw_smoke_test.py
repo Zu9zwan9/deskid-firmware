@@ -502,7 +502,8 @@ def run_status(card: Card, report: Report) -> None:
     report.note("consecutive failed matches", str(number(0x09)))
     report.note("fingerprint lockout", f"{number(0x0A)} s remaining")
     report.note("enrolled templates", str(number(0x0B)))
-    report.note("wake line (GPIO4)", "high" if number(0x0C) else "low (optional)")
+    # The R503 rests high and reads low for as long as a finger is on the ring.
+    report.note("wake line (GPIO4)", "high" if number(0x0C) else "low")
     report.note("last match, finger-on to confirmed",
                 f"{number(0x0D)} ms" if 0x0D in fields else "not reported by this firmware")
     outcomes = {0: "none yet", 1: "matched", 2: "timed out, no finger", 3: "aborted by host",

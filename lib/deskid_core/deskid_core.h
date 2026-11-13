@@ -281,4 +281,28 @@ private:
     uint32_t emissions_ = 0;
 };
 
+// The R503's touch-sense output, as far as it can be believed.
+//
+// The sensor holds WAKEUP at one level while the ring is empty and drives it
+// to the other for as long as a finger rests there. Which level means a
+// finger is a property of the sensor and is passed in. The first firmware to
+// use the line had it backwards and read an empty ring as a finger.
+//
+// A level that has never changed proves nothing. A wire that was never
+// soldered and one bridged to a rail both read as a steady, confident answer,
+// so the line counts only after it has been seen at both levels.
+class WakeLine {
+public:
+    explicit WakeLine(bool touchedLevel);
+
+    void observe(bool level);
+    bool usable() const;
+    /// A finger is on the ring. Always false until the line is usable.
+    bool touched(bool level) const;
+
+private:
+    bool touchedLevel_;
+    uint8_t seen_ = 0;
+};
+
 }  // namespace deskid
