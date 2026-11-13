@@ -137,6 +137,8 @@ constexpr uint8_t kMaximumArmSeconds = 120;
 // by that same limiter and by the fact that an attacker must already hold
 // the device.
 constexpr uint8_t kFingerprintSecurityLevel = 3;
+// How long a finger rests on the ring before its enrollment image is taken.
+constexpr int64_t kEnrollSettleMilliseconds = 300;
 // A held finger gets several captures before it has to lift, the way Touch ID
 // keeps trying: partial contact and a smeared first image are the normal case,
 // not an attack. Every rejected *match* still counts against the rate limiter.
@@ -1040,6 +1042,8 @@ public:
             return false;
         }
         refreshTemplateCount();
+        // Whatever the ring showed before this start is not known.
+        ring_ = Ring::touched;
         turnLedOff();
         return true;
     }
@@ -1136,71 +1140,137 @@ public:
         }
         templateCount_ = 0;
         templateCountKnown_ = true;
-        enrollStage_ = 0;
+        enrollRingSeenEmpty_ = false;
+        enrollFingerDownAtUs_ = 0;
         return true;
     }
 
+    // One image is one template. Two touches that had to agree with each
+    // other could not record how a finger lands when nobody is thinking
+    // about it, and that is the placement worth having: on 2026-11-13 pairs
+    // of natural touches failed to merge for minutes. A finger is a set of
+    // such templates, the way a phone records one from many placements.
     uint8_t enrollStep() {
-        if (enrollStage_ == 0) {
-            const uint8_t confirmation = captureInto(0x01);
-            if (confirmation == 0x02) {
-                return 0;
+        const bool present = fingerPresent();
+        // The first image has to come from a touch that began for it. The
+        // finger that authorized this enrollment, or the placement stored a
+        // moment ago, is still on the ring when the step runs, and capturing
+        // it again would add nothing.
+        if (!enrollRingSeenEmpty_) {
+            // The last look, stored or failed, finishes before the next.
+            if (ringBusy()) {
+                return present ? 4 : 0;
             }
-            if (confirmation != 0x00) {
-                return abortEnrollment();
+            if (present) {
+                show(Ring::enrollLift);
+                return 4;
             }
-            enrollStage_ = 1;
-            showSuccess();
-            return 1;
+            enrollRingSeenEmpty_ = true;
+            show(Ring::enrollPlace);
         }
-        if (enrollStage_ == 1) {
-            if (fingerPresent()) {
-                return 1;
-            }
-            enrollStage_ = 2;
-            showWaiting();
-            return 2;
+        if (!present) {
+            enrollFingerDownAtUs_ = 0;
+            return 0;
         }
-        uint8_t confirmation = captureInto(0x02);
+        // An image taken as the finger lands is smeared, and with one image a
+        // template there is no second to make up for it.
+        const int64_t now = esp_timer_get_time();
+        if (enrollFingerDownAtUs_ == 0) {
+            enrollFingerDownAtUs_ = now;
+        }
+        if (now - enrollFingerDownAtUs_ < kEnrollSettleMilliseconds * 1000LL) {
+            return 0;
+        }
+        uint8_t confirmation = captureInto(0x01);
         if (confirmation == 0x02) {
-            return 2;
+            return 0;
+        }
+        if (confirmation != 0x00) {
+            return abortEnrollment(Ring::adjust);
         }
         // DeskID never deletes a template, so the library has no gaps and the
         // count is also the next free page. A count the sensor never reported
         // would aim this at page 0 and overwrite whoever is enrolled there.
         if (!templateCountKnown_) {
-            return abortEnrollment();
+            return abortEnrollment(Ring::failure);
+        }
+        // RegModel wants two character files and gets the same image twice.
+        // ponytail: if this unit refuses that, the character file in buffer
+        // 1 is stored as it is; the two have one format on this sensor
+        // family. Which path ran is not reported.
+        const uint8_t second[] = {0x02};
+        size_t responseLength = 0;
+        if (command(0x02, second, sizeof(second), confirmation, nullptr, 0,
+                    responseLength) &&
+            confirmation == 0x00) {
+            command(0x05, nullptr, 0, confirmation, nullptr, 0,
+                    responseLength);
         }
         const uint8_t store[] = {
             0x01,
             static_cast<uint8_t>(templateCount_ >> 8),
             static_cast<uint8_t>(templateCount_),
         };
-        size_t responseLength = 0;
-        if (confirmation != 0x00 ||
-            !command(0x05, nullptr, 0, confirmation, nullptr, 0,
-                     responseLength) ||
-            confirmation != 0x00 ||
-            !command(0x06, store, sizeof(store), confirmation, nullptr, 0,
+        if (!command(0x06, store, sizeof(store), confirmation, nullptr, 0,
                      responseLength) ||
             confirmation != 0x00) {
-            return abortEnrollment();
+            return abortEnrollment(Ring::failure);
         }
-        enrollStage_ = 0;
+        enrollRingSeenEmpty_ = false;
+        enrollFingerDownAtUs_ = 0;
         refreshTemplateCount();
-        showSuccess();
+        show(Ring::enrollStored);
         return 3;
     }
 
-    void showWaiting() { setLed(0x01, 0x02, 0); }
+    // What the ring is saying. One look a state, so a glance at the sensor
+    // answers "what does it want from me": see kRingLooks.
+    enum class Ring : uint8_t {
+        off,
+        waiting,       // a host asked for a touch
+        touched,       // contact, image being read
+        success,
+        failure,       // the touch was rejected
+        adjust,        // no usable image: lift and lie flatter
+        lockedOut,
+        enrollPlace,   // place the finger to enroll
+        enrollLift,    // lift the finger
+        enrollStored,
+    };
+
+    void show(Ring ring) {
+        const RingLook &look = kRingLooks[static_cast<size_t>(ring)];
+        if (ring == ring_ && look.milliseconds == 0) {
+            return;  // already showing it; spare the UART
+        }
+        ring_ = ring;
+        ringOffAtUs_ = look.milliseconds == 0
+                           ? 0
+                           : esp_timer_get_time() + look.milliseconds * 1000LL;
+        setLed(look.control, look.color, 0);
+    }
+    // Ends a timed look. The sensor's own flash count would do it too, but
+    // its speed scale is undocumented and a look cut short by the next
+    // command is how the red flash went unseen.
+    void serviceRing() {
+        if (ringBusy() && esp_timer_get_time() >= ringOffAtUs_) {
+            show(Ring::off);
+        }
+    }
+    bool ringBusy() const { return ringOffAtUs_ != 0; }
+    bool showing(Ring ring) const { return ring_ == ring; }
+
+    void showWaiting() { show(Ring::waiting); }
     // The ring answers contact, not the match that follows it. Reading an
     // image takes a few hundred milliseconds and a dark sensor during them
     // reads as a sensor that missed the finger, so the light goes solid the
-    // moment skin lands and simply stays solid if the match succeeds.
-    void showTouched() { setLed(0x03, 0x02, 0); }
-    void showSuccess() { setLed(0x03, 0x02, 0); }
-    void showFailure() { setLed(0x02, 0x01, 2); }
-    void turnLedOff() { setLed(0x04, 0x02, 0); }
+    // moment skin lands.
+    void showTouched() { show(Ring::touched); }
+    void showSuccess() { show(Ring::success); }
+    void showFailure() { show(Ring::failure); }
+    void showAdjust() { show(Ring::adjust); }
+    void showLockedOut() { show(Ring::lockedOut); }
+    void turnLedOff() { show(Ring::off); }
 
     uint8_t state() const { return state_; }
     uint8_t lastConfirmation() const { return lastConfirmation_; }
@@ -1395,9 +1465,10 @@ private:
         return confirmation;
     }
 
-    uint8_t abortEnrollment() {
-        enrollStage_ = 0;
-        showFailure();
+    uint8_t abortEnrollment(Ring look) {
+        enrollRingSeenEmpty_ = false;
+        enrollFingerDownAtUs_ = 0;
+        show(look);
         return 0xFF;
     }
 
@@ -1414,12 +1485,41 @@ private:
         }
     }
 
+    // R503 AuraLedConfig. Control: 1 breathing, 2 flashing, 3 on, 4 off.
+    // Colour: 1 red, 2 blue, 3 purple on every unit; 4 green, 5 yellow,
+    // 6 cyan and 7 white on units with a green LED. The numbers read as a
+    // red, blue, green mask, so a unit without green is asked again for the
+    // same look less its green: white becomes purple and yellow red. Green
+    // alone would leave nothing, and becomes blue.
+    struct RingLook {
+        uint8_t control;
+        uint8_t color;
+        uint16_t milliseconds;  // 0: stays until the next look
+    };
+    static constexpr RingLook kRingLooks[] = {
+        {0x04, 0x02, 0},     // off
+        {0x01, 0x07, 0},     // waiting: white, breathing
+        {0x03, 0x02, 0},     // touched: blue
+        {0x03, 0x04, 700},   // success: green
+        {0x02, 0x01, 1300},  // failure: red, flashing
+        {0x02, 0x05, 1300},  // adjust: yellow, flashing
+        {0x01, 0x01, 0},     // lockedOut: red, breathing
+        {0x01, 0x03, 0},     // enrollPlace: purple, breathing
+        {0x03, 0x03, 0},     // enrollLift: purple
+        {0x02, 0x04, 1000},  // enrollStored: green, flashing
+    };
+
     void setLed(uint8_t control, uint8_t color, uint8_t times) {
-        const uint8_t parameters[] = {control, 0x40, color, times};
+        uint8_t parameters[] = {control, 0x40, color, times};
         uint8_t confirmation = 0xFF;
         size_t responseLength = 0;
-        command(0x35, parameters, sizeof(parameters), confirmation, nullptr, 0,
-                responseLength);
+        const bool sent = command(0x35, parameters, sizeof(parameters),
+                                  confirmation, nullptr, 0, responseLength);
+        if (sent && confirmation != 0x00 && (color & 0x04) != 0) {
+            parameters[2] = (color & 0x03) != 0 ? (color & 0x03) : 0x02;
+            command(0x35, parameters, sizeof(parameters), confirmation,
+                    nullptr, 0, responseLength);
+        }
     }
 
     uint8_t state_ = 0;
@@ -1428,7 +1528,11 @@ private:
     uint8_t lastConfirmation_ = 0;
     uint16_t templateCount_ = 0;
     bool templateCountKnown_ = false;
-    uint8_t enrollStage_ = 0;
+    bool enrollRingSeenEmpty_ = false;
+    int64_t enrollFingerDownAtUs_ = 0;
+    // Unknown at power-up, so anything but off: the first off is then sent.
+    Ring ring_ = Ring::touched;
+    int64_t ringOffAtUs_ = 0;
 };
 
 // Finger-on to match-confirmed for the last successful authentication, the
@@ -1473,6 +1577,7 @@ bool ringArmed() { return millisecondsSinceBoot() < g_ringArmedUntilMs; }
 
 bool g_idleWaitForRemoval = false;
 bool g_idleRingLit = false;
+bool g_idleLockoutShown = false;
 // When the finger currently on the ring first landed. A capture that comes
 // back "image too messy" is retried, and timing from the retry rather than
 // from contact would quietly flatter the one number the product is judged by.
@@ -1645,8 +1750,7 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
 #else
     // sensorState 1 is "the R503 answered". An unwired or dead sensor must
     // not turn this into a UART probe every 40 ms forever.
-    if (sensor.state() != 1 || sensor.templateCount() == 0 ||
-        limiter.locked(millisecondsSinceBoot())) {
+    if (sensor.state() != 1 || sensor.templateCount() == 0) {
         return;
     }
 
@@ -1655,6 +1759,24 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
     // host has to say when it is worth spending an image capture on.
     const bool present = sensor.wakeLineUsable() ? sensor.wakeLineTouched()
                                                  : sensor.fingerPresent();
+    if (limiter.locked(millisecondsSinceBoot())) {
+        // A locked-out ring that stays dark reads as a dead board. It says
+        // so to whoever touches it, and asks the sensor nothing.
+        if (present != g_idleLockoutShown) {
+            g_idleLockoutShown = present;
+            if (present) {
+                sensor.showLockedOut();
+            } else {
+                sensor.turnLedOff();
+            }
+        }
+        return;
+    }
+    if (g_idleLockoutShown) {
+        // The lockout ran out under a resting finger.
+        g_idleLockoutShown = false;
+        sensor.turnLedOff();
+    }
     if (!present) {
         g_idleWaitForRemoval = false;
         g_idleTouchStartedAtUs = 0;
@@ -1695,13 +1817,11 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
             g_earlyTouch.record(millisecondsSinceBoot());
             sensor.showSuccess();
             // The touch is recorded first, so the login instruction the typed
-            // Return sets off finds it. Typing takes longer than the flash.
+            // Return sets off finds it.
             if (g_autotype.take(millisecondsSinceBoot())) {
                 typeDummyPin();
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(250));
             }
-            sensor.turnLedOff();
+            // The look ends itself; a lifting finger must not cut it short.
             g_idleRingLit = false;
             g_idleWaitForRemoval = true;
             return;
@@ -1712,7 +1832,6 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
                 return;  // still the same finger; try the next image
             }
             sensor.showFailure();
-            sensor.turnLedOff();
             g_idleRingLit = false;
             g_idleWaitForRemoval = true;
             return;
@@ -1722,13 +1841,17 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
             // capture. Nothing was rejected, so nothing is spent and the ring
             // stays lit while the next poll tries again — blinking it off and
             // on per attempt would read as a sensor that keeps losing the
-            // finger.
-            if (++g_idleRetriesThisTouch >= kRetriesPerTouch * 2 ||
-                limiter.locked(millisecondsSinceBoot())) {
-                sensor.turnLedOff();
-                g_idleRingLit = false;
-                g_idleWaitForRemoval = true;
+            // finger. When the tries run out the ring asks for a better
+            // placement, which is a different thing from a rejection.
+            if (limiter.locked(millisecondsSinceBoot())) {
+                sensor.showFailure();
+            } else if (++g_idleRetriesThisTouch >= kRetriesPerTouch * 2) {
+                sensor.showAdjust();
+            } else {
+                return;
             }
+            g_idleRingLit = false;
+            g_idleWaitForRemoval = true;
             return;
     }
 #endif
@@ -1775,6 +1898,7 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
     int retriesThisTouch = 0;
 
     while (esp_timer_get_time() < deadline) {
+        sensor.serviceRing();
         if (deskid::ccidRequestWasAborted(request) ||
             deskid::ccidPowerEpoch() != powerEpoch) {
             g_lastGateOutcome = deskid::ccidRequestWasAborted(request) ? 3 : 4;
@@ -1791,8 +1915,9 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
         if (!sensor.fingerPresent()) {
             fingerSeenAt = 0;
             retriesThisTouch = 0;
-            if (waitForFingerRemoval) {
-                waitForFingerRemoval = false;
+            waitForFingerRemoval = false;
+            // Breathing again, once a rejection has had its flash.
+            if (!sensor.ringBusy()) {
                 sensor.showWaiting();
             }
             vTaskDelay(pdMS_TO_TICKS(20));
@@ -1819,16 +1944,14 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
                     (esp_timer_get_time() - fingerSeenAt) / 1000);
                 g_lastGateOutcome = 1;
                 ledger.matched();
+                // The look ends itself, so the host has its answer at once.
                 sensor.showSuccess();
-                vTaskDelay(pdMS_TO_TICKS(250));
-                sensor.turnLedOff();
                 g_idleWaitForRemoval = true;
                 return true;
             case R503Sensor::MatchResult::notMatched:
                 // Already charged and written down, before the verdict.
                 if (limiter.locked(millisecondsSinceBoot())) {
                     sensor.showFailure();
-                    sensor.turnLedOff();
                     g_idleWaitForRemoval = true;
                     return false;
                 }
@@ -1844,7 +1967,6 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
                 // If the sensor then gave none, the lockout stands.
                 if (limiter.locked(millisecondsSinceBoot())) {
                     sensor.showFailure();
-                    sensor.turnLedOff();
                     g_idleWaitForRemoval = true;
                     return false;
                 }
@@ -1854,7 +1976,7 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
                     vTaskDelay(pdMS_TO_TICKS(80));
                     break;
                 }
-                sensor.showFailure();
+                sensor.showAdjust();
                 waitForFingerRemoval = true;
                 break;
             case R503Sensor::MatchResult::noFinger:
@@ -1958,6 +2080,7 @@ extern "C" void app_main() {
     int64_t nextRecovery = 0;
     int64_t nextArmedScan = 0;
     while (true) {
+        sensor.serviceRing();
         if (!deskid::waitForCcidRequest(request, kIdleScanMilliseconds)) {
             // Nothing from the host, so the ring belongs to the user.
             const int64_t now = esp_timer_get_time();
@@ -1979,6 +2102,12 @@ extern "C" void app_main() {
                 sensor.recover();
             }
             sensor.observeWakeLine();
+            if (applet.enrollmentOpen()) {
+                // The ring belongs to the enrollment. The finger on it is
+                // new, and matching it would spend attempts on a finger that
+                // cannot match yet.
+                continue;
+            }
             if (sensor.wakeLineUsable()) {
                 scanForEarlyTouch(sensor, presenceLimiter, attempts);
             } else if (ringArmed() && now >= nextArmedScan) {

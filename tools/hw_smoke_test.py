@@ -71,20 +71,41 @@ ENROLL_STEP = bytes.fromhex("80E1000000")
 ENROLL_STAGE_DONE = 0x03
 ENROLL_STAGE_FAILED = 0xFF
 ENROLL_STAGES = {
-    0x00: "place your finger on the sensor",
-    0x01: "captured — now lift your finger off the sensor",
-    0x02: "touch the same finger again",
-    ENROLL_STAGE_DONE: "enrolled and stored",
-    ENROLL_STAGE_FAILED: "that attempt failed — starting over",
+    0x00: "place your finger",
+    0x04: "lift your finger off the sensor",
+    ENROLL_STAGE_DONE: "stored",
+    ENROLL_STAGE_FAILED: "that image was not usable — lift and place the finger again",
 }
+# One image is one template, and a finger is a set of them: the sensor sees a
+# part of the finger at a time, so the placements have to cover how it lands
+# in daily use. kEnrollmentSessionTemplates in the firmware is how many one
+# authorizing match pays for.
+ENROLL_PLACEMENTS = (
+    "flat, the way you normally touch",
+    "the same again",
+    "a little to the left",
+    "a little to the right",
+    "a little toward the fingertip",
+    "a little toward the joint",
+    "rolled slightly onto its left edge",
+    "rolled slightly onto its right edge",
+    "the way you touch in a hurry",
+    "in a hurry again",
+    "from the side your hand comes from",
+    "normally, one last time",
+)
 ENROLL_ERRORS = {
     SW_SECURITY_NOT_SATISFIED: "6982 — an already enrolled finger has to match first",
     SW_AUTHENTICATION_BLOCKED: "6983 — the rate limiter has locked the sensor out",
     SW_INSTRUCTION_NOT_SUPPORTED: "6D00 — the flashed image is deskid-bringup, which has no sensor",
 }
-ENROLL_TIMEOUT_SECONDS = 60.0
+# The ring waits 30 s for the authorizing match, and the match, like each
+# stored placement after it, keeps the enrollment open for 60 s
+# (kEnrollmentSessionMilliseconds).
+ENROLL_TIMEOUT_SECONDS = 90.0
 ENROLL_POLL_SECONDS = 0.25
-ENROLL_FAILURE_LIMIT = 3
+# Unusable images in a row, for one placement.
+ENROLL_FAILURE_LIMIT = 8
 
 # kAuthenticationTimeoutMilliseconds in src/main.cpp. Only used to tell the
 # operator how long the blue ring will wait, so drift costs a wrong countdown
@@ -552,7 +573,7 @@ def run_status(card: Card, report: Report) -> None:
                                  0x0B, 0x0C})
 
 
-def run_enroll(card: Card, report: Report) -> None:
+def run_enroll(card: Card, report: Report, placements: int) -> None:
     card.send(SELECT_PIV)
     fields = status_object(card)
     if not report.check("GET DATA status (5FFF01) before enrolling", bool(fields)):
@@ -564,10 +585,11 @@ def run_enroll(card: Card, report: Report) -> None:
                 else "the sensor is empty, so this first finger enrolls freely")
 
     deadline = time.monotonic() + ENROLL_TIMEOUT_SECONDS
-    problem = f"no enrollment within {ENROLL_TIMEOUT_SECONDS:.0f} s"
+    problem = f"no placement within {ENROLL_TIMEOUT_SECONDS:.0f} s"
     stage: int | None = None
     failures = 0
-    while time.monotonic() < deadline:
+    stored = 0
+    while stored < placements and time.monotonic() < deadline:
         data, status, _ = card.send(ENROLL_STEP)
         if status != SW_OK or len(data) != 1:
             problem = ENROLL_ERRORS.get(status, f"SW {status:04X}")
@@ -575,22 +597,30 @@ def run_enroll(card: Card, report: Report) -> None:
         if data[0] != stage:
             stage = data[0]
             message = ENROLL_STAGES.get(stage, f"unknown stage 0x{stage:02X}")
+            if stage == 0x00:
+                hint = ENROLL_PLACEMENTS[stored % len(ENROLL_PLACEMENTS)]
+                message += f", {stored + 1} of {placements}: {hint}"
             say(f"  ....  {message}")
-            emit("enroll", stage=stage, message=message)
+            emit("enroll", stage=stage, message=message, stored=stored)
             if stage == ENROLL_STAGE_FAILED:
                 failures += 1
         if stage == ENROLL_STAGE_DONE:
-            problem = ""
-            break
+            stored += 1
+            failures = 0
+            stage = None  # the next poll says what comes after
+            deadline = time.monotonic() + ENROLL_TIMEOUT_SECONDS
         if failures >= ENROLL_FAILURE_LIMIT:
-            problem = f"{failures} attempts failed in a row"
+            problem = f"{failures} unusable images in a row"
             break
         time.sleep(ENROLL_POLL_SECONDS)
 
     fields = status_object(card)
     after = status_number(fields, 0x0B)
-    if report.check("enroll a fingerprint", not problem and after > before,
-                    problem or f"templates {before} -> {after}"):
+    complete = stored == placements and after - before == stored
+    if report.check("enroll a finger", complete,
+                    f"templates {before} -> {after}" if complete
+                    else f"{problem}; stored {stored} of {placements}, "
+                         f"templates {before} -> {after}"):
         return
     sensor = status_number(fields, 0x06)
     report.note("sensor", f"{sensor} ({SENSOR_STATES.get(sensor, 'unknown')})")
@@ -696,6 +726,9 @@ def main() -> int:
                         help="read the diagnostic status object (5FFF01)")
     parser.add_argument("--enroll", action="store_true",
                         help="enroll a fingerprint on the sensor, guided and interactive")
+    parser.add_argument("--placements", type=int, default=len(ENROLL_PLACEMENTS),
+                        help="how many placements of the finger --enroll records "
+                             "(default %(default)s)")
     parser.add_argument("--pinpad", action="store_true",
                         help="VERIFY through the reader's PIN pad, i.e. the fingerprint ring")
     parser.add_argument("--download-mode", action="store_true",
@@ -760,7 +793,7 @@ def main() -> int:
             say("\nenrollment")
             card = Card(context, reader)
             try:
-                run_enroll(card, report)
+                run_enroll(card, report, arguments.placements)
             finally:
                 card.close()
 

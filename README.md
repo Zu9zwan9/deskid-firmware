@@ -27,7 +27,22 @@ The clip shows a locked Mac unlocking on one touch, in real time, on the first h
 - R503 packet validation, timeouts, password rotation and security level `3`, the R503 default. Enrollment runs over the card channel (`80 E1 00 00 00`) because a soldered sensor has no other host.
 - Development and production firmware profiles, and host-side APDU tests.
 
-The R503 has red and blue LEDs. The ring breathes blue while a request waits, turns solid blue on contact and through the match, and flashes red on refusal. Between requests the ring is dark and the sensor still scans.
+The ring says what the board wants:
+
+| Ring | Meaning |
+|---|---|
+| dark | idle; the sensor still scans |
+| white, breathing | a request waits for a touch |
+| blue | contact, the image is being read |
+| green, 0.7 s | match |
+| red, flashing | the touch was rejected |
+| yellow, flashing | no usable image: lift and lie flatter |
+| red, breathing | locked out; shown while a finger rests on the ring |
+| purple, breathing | enrollment: place the finger |
+| purple | enrollment: lift the finger |
+| green, flashing | enrollment: template stored |
+
+R503 units without a green LED have red, blue and purple only. A look the sensor refuses is sent again less its green, so white becomes purple and yellow red, and green itself becomes blue. The looks are `kRingLooks` in `src/main.cpp`.
 
 ## Hardware
 
@@ -191,9 +206,13 @@ A soldered R503 has no UART left for an external enrollment tool, so DeskID enro
 python3 tools/hw_smoke_test.py --enroll
 ```
 
-Touch the sensor, lift when told, then touch the same finger again. Each `80 E1 00 00 00` performs one step of the R503 sequence and returns at once, so the CCID channel does not stay open while a person moves a finger. The tool prints each stage change and reports success once the template count in the status object has gone up.
+A finger is recorded as placements, one image and one template each. `--enroll` asks for 12 (`--placements`) and says how to lay the finger for each, because the sensor sees a part of the finger at a time and the placements have to cover how it lands in daily use. With an empty library the first placement needs no match. With fingers already enrolled the tool first waits for one of them: the ring breathes white, an enrolled finger matches, and that match opens enrollment for 60 s. Each stored placement renews the 60 s, up to 12 on one match (`kEnrollmentSessionMilliseconds`, `kEnrollmentSessionTemplates`). The finger has to lift between placements, and an image is taken after it has rested for 0.3 s. The ring breathes purple for "place", turns solid purple for "lift" and flashes green when a placement is stored. The idle scan pauses for the session, so the new finger is not matched and costs no attempts.
 
-While the library is empty, enrollment needs no authorization. An empty sensor cannot produce a match, so a gate would make the first finger impossible to enroll. Empty means the sensor has reported zero templates. A count the sensor has not reported is treated as a full library. Once one template exists, `80 E1` is user-presence gated like `0x47`, `0xDB` and `80 F0`: a new finger requires an existing one. `80 E2` empties the library and needs a match too.
+Each `80 E1 00 00 00` performs one step of the R503 sequence and returns at once, so the CCID channel does not stay open while a person moves a finger. The tool prints each stage change and reports success once the template count in the status object has gone up.
+
+While the library is empty, enrollment needs no authorization. An empty sensor cannot produce a match, so a gate would make the first finger impossible to enroll. Empty means the sensor has reported zero templates. A count the sensor has not reported is treated as a full library. Once one template exists, `80 E1` starts with a match by an enrolled finger: a new finger requires an existing one. Earlier firmware asked for that match at every step and took each image from the touch that had just matched, so the only thing it could add was a finger the sensor already knew, lying where it already knew it. `80 E2` empties the library and needs a match too.
+
+The sensor window is smaller than a fingertip, and a finger that lands on another part of its pad than the one enrolled is rejected. On 2026-11-13 four calm touches of two seconds matched, and thirteen hurried ones at real prompts did not. Enroll the same finger several times, lying the ways it lands in a hurry.
 
 Press flat and hold for a second. A held finger gets three match attempts and six capture attempts before the firmware asks for it to lift (`kRetriesPerTouch` in `src/main.cpp`). A red flash means the finger has used its attempts: lift and try again. Each rejected match counts toward the five-failure lockout. If the status object shows `consecutive failed matches: 0` after a timeout, no image passed quality and no match was attempted. Press flatter.
 
@@ -225,7 +244,7 @@ macOS draws its own PIN field for a smart card at the lock screen and in `pam_sm
 
 The firmware now scans the sensor between host requests. A match is kept for 30 s and spent by the next login instruction:
 
-1. Touch the sensor as you sit down. The ring turns solid blue on contact and matches in about 0.8 s.
+1. Touch the sensor as you sit down. The ring turns solid blue on contact, matches in about 0.8 s and shows green.
 2. Type any digits and press Return.
 3. The card answers without waiting. Status tag `0x0E` reports that an earlier touch answered, and `0x11` counts those answers.
 
