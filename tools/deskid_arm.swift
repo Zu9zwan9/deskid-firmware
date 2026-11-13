@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Maksym Bardakh. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-PolyForm-Strict-1.0.0
+// Source-available under LICENSE.md with the permissions in LICENSING.md.
+
 // Arms a DeskID board to type the PIN digits after the next fingerprint match.
 //
 //     swift tools/deskid_arm.swift        # 10 seconds
