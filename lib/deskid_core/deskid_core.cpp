@@ -1017,7 +1017,23 @@ bool AttemptLedger::charge(uint64_t nowMilliseconds) {
                        limiter_.lockoutCount());
 }
 
+bool AttemptLedger::chargeTouch(uint64_t nowMilliseconds) {
+    if (touchVerdicts_ == 0) {
+        if (!charge(nowMilliseconds)) {
+            return false;
+        }
+    } else if (touchVerdicts_ >= kVerdictsPerTouch ||
+               limiter_.locked(nowMilliseconds)) {
+        return false;
+    }
+    ++touchVerdicts_;
+    return true;
+}
+
+void AttemptLedger::touchEnded() { touchVerdicts_ = 0; }
+
 void AttemptLedger::matched() {
+    touchVerdicts_ = 0;
     limiter_.recordSuccess();
     store_.save(limiter_.consecutiveFailures(), limiter_.lockoutCount());
 }

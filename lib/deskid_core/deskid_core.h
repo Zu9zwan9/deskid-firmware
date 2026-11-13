@@ -210,6 +210,9 @@ public:
     virtual bool save(uint32_t consecutiveFailures, uint32_t lockoutCount) = 0;
 };
 
+/// How many images of one touch may be put to the sensor on one charge.
+constexpr uint8_t kVerdictsPerTouch = 3;
+
 // Charges a match attempt before the sensor is asked for its verdict.
 //
 // The verdict is the secret. Counting a failure after hearing it leaves a gap
@@ -229,12 +232,21 @@ public:
     /// the sensor must not be asked: locked out, or the charge did not reach
     /// storage.
     bool charge(uint64_t nowMilliseconds);
-    /// The verdict was a match. Clears the counters and persists that.
+    /// charge(), once a touch. A resting finger is imaged several times,
+    /// since the first image is often smeared, and those images are one
+    /// attempt by one finger: the first is charged, and the rest ride on it
+    /// up to kVerdictsPerTouch. False means the sensor must not be asked.
+    bool chargeTouch(uint64_t nowMilliseconds);
+    /// The finger left. The next image belongs to a new touch.
+    void touchEnded();
+    /// The verdict was a match. Clears the counters and persists that. A
+    /// further verdict on the same touch is charged like a new one.
     void matched();
 
 private:
     RateLimiter &limiter_;
     LimiterStore &store_;
+    uint8_t touchVerdicts_ = 0;
 };
 
 // A fingerprint match that happened before any host asked for one.
