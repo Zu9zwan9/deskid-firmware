@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Maksym Bardakh. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-PolyForm-Strict-1.0.0
+# Source-available under LICENSE.md with the permissions in LICENSING.md.
 """Exercise a connected DeskID board through the macOS PC/SC stack.
 
 Talks to the real reader the same way the operating system does, so a pass
