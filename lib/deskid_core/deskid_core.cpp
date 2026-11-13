@@ -653,6 +653,7 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
         }
         verified_ = true;
         verifiedAtMilliseconds_ = diagnostics_.uptimeMilliseconds();
+        grantAgreements();
         status(0x9000, response, responseCapacity, responseLength);
         return TransceiveStatus::complete;
     }
@@ -751,8 +752,9 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
         }
 
         // Slot 9D: ECDH. macOS uses it at login to unwrap the keychain
-        // password, so it sits behind the same gate as a signature, and one
-        // verified touch buys one private-key operation in either slot.
+        // password, so it sits behind the same gate as a signature. The
+        // touch that pays for a login's signature buys its key agreement too
+        // (kAgreementsPerTouch); any other agreement needs its own touch.
         if (apdu.parameter2 == 0x9D) {
             Bytes peerPoint{nullptr, 0};
             if (!parseKeyAgreementTemplate(apdu.data, peerPoint)) {
@@ -765,11 +767,16 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
                 status(0x6A88, response, responseCapacity, responseLength);
                 return TransceiveStatus::complete;
             }
-            if (!verificationHeld() && !userPresent) {
+            const bool bought =
+                agreementsLeft_ > 0 && diagnostics_.uptimeMilliseconds() <
+                                           agreementsUntilMilliseconds_;
+            if (!bought && !userPresent) {
                 return TransceiveStatus::userPresenceRequired;
             }
             // Spent here, whether or not the point turns out to be usable.
-            verified_ = false;
+            if (bought) {
+                --agreementsLeft_;
+            }
 
             uint8_t encoded[4 + 32] = {0x7C, 0x22, 0x82, 0x20};
             size_t secretLength = 0;
@@ -797,7 +804,8 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
             status(0x6A88, response, responseCapacity, responseLength);
             return TransceiveStatus::complete;
         }
-        if (!verificationHeld() && !userPresent) {
+        const bool verified = verificationHeld();
+        if (!verified && !userPresent) {
             return TransceiveStatus::userPresenceRequired;
         }
 
@@ -810,6 +818,10 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
             return TransceiveStatus::complete;
         }
         verified_ = false;
+        if (!verified) {
+            // The touch was spent here, with no VERIFY to have granted them.
+            grantAgreements();
+        }
 
         uint8_t encoded[96];
         Writer writer(encoded, sizeof(encoded));
@@ -930,6 +942,12 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
 
 // A verified touch is good for one signature and for a bounded time. Checking
 // it is also what retires a stale one.
+void PivApplet::grantAgreements() {
+    agreementsLeft_ = kAgreementsPerTouch;
+    agreementsUntilMilliseconds_ =
+        diagnostics_.uptimeMilliseconds() + kAgreementValidMilliseconds;
+}
+
 bool PivApplet::verificationHeld() {
     if (verified_ && diagnostics_.uptimeMilliseconds() -
                              verifiedAtMilliseconds_ >=
