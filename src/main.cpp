@@ -66,6 +66,18 @@ constexpr uint8_t kBuildVariant = 1;
 constexpr gpio_num_t kFingerprintReceivePin = GPIO_NUM_43;
 constexpr gpio_num_t kFingerprintTransmitPin = GPIO_NUM_44;
 constexpr gpio_num_t kFingerprintWakePin = GPIO_NUM_4;
+// The level WAKEUP takes with a finger on the ring. Measured on this bench's
+// R503 on 2026-11-13 at ten samples a second: driven high while the ring is
+// empty, driven low for the whole of each touch. A sensor with the opposite
+// sense builds with -DDESKID_WAKE_TOUCHED_LEVEL=1.
+#ifndef DESKID_WAKE_TOUCHED_LEVEL
+#define DESKID_WAKE_TOUCHED_LEVEL 0
+#endif
+constexpr bool kWakeTouchedLevel = DESKID_WAKE_TOUCHED_LEVEL != 0;
+// The internal bias holds an unconnected pin at the resting level, so a
+// missing wire reads as an empty ring and never as a finger.
+constexpr gpio_pull_mode_t kWakeRestingPull =
+    kWakeTouchedLevel ? GPIO_PULLDOWN_ONLY : GPIO_PULLUP_ONLY;
 constexpr uart_port_t kFingerprintUart = UART_NUM_1;
 constexpr uint32_t kFingerprintBaudRate = 57600;
 constexpr uint16_t kFingerprintCapacity = 200;
@@ -91,7 +103,7 @@ constexpr uint32_t kAuthenticationTimeoutMilliseconds = 30000;
 constexpr uint64_t kEarlyTouchValidMilliseconds =
     kAuthenticationTimeoutMilliseconds;
 // Idle scan cadence. The scan runs off the R503's WAKEUP line and nothing
-// else: that pin is a touch-sense output the sensor drives high for about 5 uA,
+// else: that pin is a touch-sense output the sensor powers from about 5 uA,
 // so watching it costs one GPIO read.
 //
 // The obvious fallback — GenImg over UART, the way fingerPresent() probes
@@ -778,8 +790,11 @@ public:
         gpio_config_t wakeConfiguration{};
         wakeConfiguration.pin_bit_mask = 1ULL << kFingerprintWakePin;
         wakeConfiguration.mode = GPIO_MODE_INPUT;
-        wakeConfiguration.pull_down_en = GPIO_PULLDOWN_ENABLE;
-        wakeConfiguration.pull_up_en = GPIO_PULLUP_DISABLE;
+        wakeConfiguration.pull_down_en = kWakeTouchedLevel
+                                             ? GPIO_PULLDOWN_ENABLE
+                                             : GPIO_PULLDOWN_DISABLE;
+        wakeConfiguration.pull_up_en =
+            kWakeTouchedLevel ? GPIO_PULLUP_DISABLE : GPIO_PULLUP_ENABLE;
         wakeConfiguration.intr_type = GPIO_INTR_DISABLE;
         ESP_RETURN_ON_ERROR(gpio_config(&wakeConfiguration), "R503",
                             "Unable to configure wake pin");
@@ -820,17 +835,15 @@ public:
         return gpio_get_level(kFingerprintWakePin) == 1;
     }
 
-    // The wake line is believed only after it has been seen at both levels.
-    // A wire that was never connected reads low forever; one bridged to a rail
-    // reads high forever. Both look like a confident answer and neither is
-    // one, and acting on either costs an image capture every poll. Measured on
-    // this bench: unwired read `floating`, and a repaired joint read
-    // `driven high` in every state including firm ring contact.
-    void observeWakeLine() {
-        wakeLineSeen_ |= wakeLineHigh() ? 0b10 : 0b01;
-    }
+    // The wake line is believed only after it has been seen at both levels:
+    // see deskid::WakeLine. An earlier note here recorded the line as high
+    // "in every state including firm ring contact". That was the resting
+    // level read between touches, and the firmware took it for a finger.
+    void observeWakeLine() { wakeLine_.observe(wakeLineHigh()); }
 
-    bool wakeLineUsable() const { return wakeLineSeen_ == 0b11; }
+    bool wakeLineUsable() const { return wakeLine_.usable(); }
+
+    bool wakeLineTouched() const { return wakeLine_.touched(wakeLineHigh()); }
 
     // What GPIO4 does under each internal bias, as `pullUp << 1 | pullDown`.
     // A pin nothing is driving follows the bias and reads 0b10; a pin being
@@ -842,10 +855,8 @@ public:
     //   0b00  driven low
     //
     // Sample it untouched and again with a finger on the ring and the wiring
-    // question answers itself, including which polarity this R503 uses. The
-    // R503 is sold with both an active-high push-pull WAKEUP and an
-    // open-drain one, and a board wired for the wrong one reads low forever
-    // and looks exactly like a board with no wire at all.
+    // question answers itself, including which sense this R503 uses. This
+    // bench's sensor reads 0b11 empty and 0b00 touched.
     uint8_t wakeLineBias() const {
         gpio_set_pull_mode(kFingerprintWakePin, GPIO_PULLUP_ONLY);
         vTaskDelay(pdMS_TO_TICKS(2));
@@ -853,6 +864,7 @@ public:
         gpio_set_pull_mode(kFingerprintWakePin, GPIO_PULLDOWN_ONLY);
         vTaskDelay(pdMS_TO_TICKS(2));
         const int pulledDown = gpio_get_level(kFingerprintWakePin);
+        gpio_set_pull_mode(kFingerprintWakePin, kWakeRestingPull);
         return static_cast<uint8_t>(pulledUp << 1 | pulledDown);
     }
 
@@ -877,11 +889,12 @@ public:
 
     // WAKEUP is a shortcut, not a requirement: GenImg answers 0x02 when the
     // ring is untouched, so an unwired or broken wake line costs a UART round
-    // trip rather than the sensor. A line stuck high is the same kind of
-    // broken: believing it reports a finger forever, so the gate never sees
-    // the ring released and refuses a second touch until it times out.
+    // trip rather than the sensor. A line read with the wrong sense is the
+    // same kind of broken: it reports a finger on an empty ring, so the gate
+    // never sees the ring released and refuses a second touch until it times
+    // out.
     bool fingerPresent() {
-        if (wakeLineUsable() && wakeLineHigh()) {
+        if (wakeLineTouched()) {
             return true;
         }
         uint8_t confirmation = 0xFF;
@@ -1253,7 +1266,7 @@ private:
     }
 
     uint8_t state_ = 0;
-    uint8_t wakeLineSeen_ = 0;
+    deskid::WakeLine wakeLine_{kWakeTouchedLevel};
     uint32_t password_ = 0;
     uint8_t lastConfirmation_ = 0;
     uint16_t templateCount_ = 0;
@@ -1482,7 +1495,7 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
     // Two ways to know a finger is there, and the cheap one is only used when
     // the hardware has proved it works: see observeWakeLine(). Otherwise the
     // host has to say when it is worth spending an image capture on.
-    const bool present = sensor.wakeLineUsable() ? sensor.wakeLineHigh()
+    const bool present = sensor.wakeLineUsable() ? sensor.wakeLineTouched()
                                                  : sensor.fingerPresent();
     if (!present) {
         g_idleWaitForRemoval = false;
