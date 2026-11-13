@@ -27,7 +27,22 @@ The clip shows a locked Mac unlocking on one touch, in real time, on the first h
 - R503 packet validation, timeouts, password rotation and security level `3`, the R503 default. Enrollment runs over the card channel (`80 E1 00 00 00`) because a soldered sensor has no other host.
 - Development and production firmware profiles, and host-side APDU tests.
 
-The R503 has red and blue LEDs. The ring breathes blue while a request waits, turns solid blue on contact and through the match, and flashes red on refusal. Between requests the ring is dark and the sensor still scans.
+The ring says what the board wants:
+
+| Ring | Meaning |
+|---|---|
+| dark | idle; the sensor still scans |
+| white, breathing | a request waits for a touch |
+| blue | contact, the image is being read |
+| cyan, 0.7 s | match |
+| red, flashing | the touch was rejected |
+| yellow, flashing | no usable image: lift and lie flatter |
+| red, breathing | locked out; shown while a finger rests on the ring |
+| purple, breathing | enrollment: place the finger |
+| purple | enrollment: lift the finger |
+| cyan, flashing | enrollment: template stored |
+
+R503 units without a green LED have red, blue and purple only. A look the sensor refuses is sent again less its green, so white becomes purple, cyan blue and yellow red. The looks are `kRingLooks` in `src/main.cpp`.
 
 ## Hardware
 
@@ -229,7 +244,7 @@ macOS draws its own PIN field for a smart card at the lock screen and in `pam_sm
 
 The firmware now scans the sensor between host requests. A match is kept for 30 s and spent by the next login instruction:
 
-1. Touch the sensor as you sit down. The ring turns solid blue on contact and matches in about 0.8 s.
+1. Touch the sensor as you sit down. The ring turns solid blue on contact, matches in about 0.8 s and shows cyan.
 2. Type any digits and press Return.
 3. The card answers without waiting. Status tag `0x0E` reports that an earlier touch answered, and `0x11` counts those answers.
 
