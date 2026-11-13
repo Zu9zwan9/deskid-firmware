@@ -576,10 +576,10 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
             const size_t versionLength =
                 std::min<size_t>(std::strlen(version), 16);
 
-            // 53 L, 82 fixed bytes, and up to 16 of version.
-            uint8_t encoded[2 + 82 + 16];
+            // 53 L, 85 fixed bytes, and up to 16 of version.
+            uint8_t encoded[2 + 85 + 16];
             Writer writer(encoded, sizeof(encoded));
-            if (!writer.byte(0x53) || !writer.length(82 + versionLength) ||
+            if (!writer.byte(0x53) || !writer.length(85 + versionLength) ||
                 !writer.byte(0x01) ||
                 !writer.byte(static_cast<uint8_t>(versionLength)) ||
                 !writer.bytes(reinterpret_cast<const uint8_t *>(version),
@@ -609,6 +609,8 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
                 !writeStatusByte(writer, 0x13, device.wakeLineBias) ||
                 !writeStatusByte(writer, 0x14,
                                  device.ringArmedSecondsRemaining) ||
+                !writeStatusByte(writer, 0x15,
+                                 device.signingSelfTestPassed) ||
                 !writer.bytes(reinterpret_cast<const uint8_t *>("\xFE\x00"),
                               2)) {
                 status(0x6F00, response, responseCapacity, responseLength);
@@ -1017,5 +1019,32 @@ bool EarlyTouch::spend(uint8_t instruction, uint64_t nowMilliseconds) {
 void EarlyTouch::clear() { expiresAtMilliseconds_ = 0; }
 
 uint32_t EarlyTouch::gates() const { return gates_; }
+
+void hedgedNonceSeed(const uint8_t randomness[32], const uint8_t scalar[32],
+                     const uint8_t digest[32],
+                     uint8_t seed[kHedgedNonceSeedSize]) {
+    // The order of the P-256 group.
+    static constexpr uint8_t kOrder[32] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17,
+        0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
+    };
+    std::memset(seed, 0, kHedgedNonceSeedSize);
+    std::memcpy(seed, randomness, 32);
+    std::memcpy(seed + 95, scalar, 32);
+
+    // bits2octets: a digest is below twice the order, so one subtraction
+    // reduces it. The digest is public, and branching on it leaks nothing.
+    uint8_t *reduced = seed + 159;
+    std::memcpy(reduced, digest, 32);
+    if (std::memcmp(digest, kOrder, 32) >= 0) {
+        int borrow = 0;
+        for (int index = 31; index >= 0; --index) {
+            const int difference = reduced[index] - kOrder[index] - borrow;
+            reduced[index] = static_cast<uint8_t>(difference);
+            borrow = difference < 0 ? 1 : 0;
+        }
+    }
+}
 
 }  // namespace deskid

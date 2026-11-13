@@ -84,7 +84,30 @@ struct DeviceStatus {
     // 0x14: seconds the host has asked the board to keep watching its own
     // sensor. Zero when the ring is watched by the wake line, or not at all.
     uint8_t ringArmedSecondsRemaining = 0;
+    // 0x15: the signing routine reproduced its known answer at power-up. A
+    // board that reports zero here refuses to sign.
+    bool signingSelfTestPassed = false;
 };
+
+/// Bytes hedgedNonceSeed() writes.
+constexpr size_t kHedgedNonceSeedSize = 191;
+
+/// Seed for the HMAC_DRBG that picks an ECDSA P-256 nonce:
+///
+///     Z || 63 zero bytes || x || 32 zero bytes || bits2octets(h)
+///
+/// Z is fresh randomness, x the private scalar and h the SHA-256 digest being
+/// signed. This is RFC 6979 with the input of
+/// draft-irtf-cfrg-det-sigs-with-noise-05 section 4. A nonce drawn from it
+/// stays secret and unique per digest when the random generator fails, which
+/// plain randomized ECDSA does not survive, and it differs between two
+/// signatures of one digest, which is what the fault attacks on plain RFC 6979
+/// need it not to do. The zeros make V || 0x00 || Z and x each fill whole
+/// SHA-256 blocks, so the scalar is hashed from a state Z has already
+/// randomized.
+void hedgedNonceSeed(const uint8_t randomness[32], const uint8_t scalar[32],
+                     const uint8_t digest[32],
+                     uint8_t seed[kHedgedNonceSeedSize]);
 
 class DeviceDiagnostics {
 public:

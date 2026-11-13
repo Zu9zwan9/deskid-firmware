@@ -2,6 +2,18 @@
 #error "DESKID_BRINGUP_NO_SENSOR must never reach a production image"
 #endif
 
+// The signature nonce comes from a generator this file seeds, and the PSA API
+// has no way to pass one in. TF-PSA-Crypto keeps mbedtls_ecdsa_sign and
+// HMAC_DRBG behind this switch. It has to precede every mbedTLS header.
+#define MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS
+
+// Those headers lay their structures out by the mbedTLS configuration, and
+// this file must read the one the library was built with. platformio.ini
+// passes it. A build that loses it would compile, and corrupt its stack.
+#if !defined(MBEDTLS_CONFIG_FILE) || !defined(TF_PSA_CRYPTO_USER_CONFIG_FILE)
+#error "build_flags must pass ESP-IDF's mbedTLS configuration, see platformio.ini"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -21,6 +33,15 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+// With ESP-IDF's configuration mbedTLS includes <pthread.h>, and picolibc
+// declares pthread_exit with __noreturn after the declarator. In C++ that is
+// [[noreturn]] on a type, a warning this file's -Werror turns into an error.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattributes"
+#include "mbedtls/md.h"
+#include "mbedtls/private/ecdsa.h"
+#include "mbedtls/private/hmac_drbg.h"
+#pragma GCC diagnostic pop
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "psa/crypto.h"
@@ -312,6 +333,82 @@ size_t encodeDerInteger(const uint8_t value[32], uint8_t *destination,
     return valueLength + 2;
 }
 
+// ECDSA over P-256 with a hedged nonce. An HMAC_DRBG seeded with fresh
+// randomness, the private scalar and the digest picks it;
+// deskid::hedgedNonceSeed has the layout and the reasons. PSA's randomized
+// ECDSA rests every nonce on the random generator alone, and one biased or
+// repeated nonce gives the key away. PSA's deterministic ECDSA repeats the
+// nonce for a repeated digest, which is what a fault attack on a token needs.
+bool signHedged(const uint8_t scalar[32], const uint8_t digest[32],
+                const uint8_t randomness[32], uint8_t rawSignature[64]) {
+    uint8_t seed[deskid::kHedgedNonceSeedSize];
+    deskid::hedgedNonceSeed(randomness, scalar, digest, seed);
+
+    mbedtls_ecp_group group;
+    mbedtls_mpi d;
+    mbedtls_mpi r;
+    mbedtls_mpi s;
+    mbedtls_hmac_drbg_context generator;
+    mbedtls_ecp_group_init(&group);
+    mbedtls_mpi_init(&d);
+    mbedtls_mpi_init(&r);
+    mbedtls_mpi_init(&s);
+    mbedtls_hmac_drbg_init(&generator);
+
+    // The nonce is the generator's first output. mbedtls_ecdsa_sign draws its
+    // blinding values from the same generator afterwards.
+    const bool succeeded =
+        mbedtls_ecp_group_load(&group, MBEDTLS_ECP_DP_SECP256R1) == 0 &&
+        mbedtls_mpi_read_binary(&d, scalar, 32) == 0 &&
+        mbedtls_hmac_drbg_seed_buf(
+            &generator, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), seed,
+            sizeof(seed)) == 0 &&
+        mbedtls_ecdsa_sign(&group, &r, &s, &d, digest, 32,
+                           mbedtls_hmac_drbg_random, &generator) == 0 &&
+        mbedtls_mpi_write_binary(&r, rawSignature, 32) == 0 &&
+        mbedtls_mpi_write_binary(&s, rawSignature + 32, 32) == 0;
+
+    mbedtls_hmac_drbg_free(&generator);
+    mbedtls_mpi_free(&s);
+    mbedtls_mpi_free(&r);
+    mbedtls_mpi_free(&d);
+    mbedtls_ecp_group_free(&group);
+    secureZero(seed, sizeof(seed));
+    return succeeded;
+}
+
+// Known answer for signHedged: the key and the SHA-256("sample") digest of
+// RFC 6979 A.2.5, with Z = 00 01 .. 1F. tools/hedged_ecdsa_reference.py
+// derives the signature and first proves itself against the RFC's own vector.
+// The draft the layout comes from publishes no vectors.
+bool signingSelfTest() {
+    static constexpr uint8_t kScalar[32] = {
+        0xC9, 0xAF, 0xA9, 0xD8, 0x45, 0xBA, 0x75, 0x16, 0x6B, 0x5C, 0x21,
+        0x57, 0x67, 0xB1, 0xD6, 0x93, 0x4E, 0x50, 0xC3, 0xDB, 0x36, 0xE8,
+        0x9B, 0x12, 0x7B, 0x8A, 0x62, 0x2B, 0x12, 0x0F, 0x67, 0x21,
+    };
+    static constexpr uint8_t kDigest[32] = {
+        0xAF, 0x2B, 0xDB, 0xE1, 0xAA, 0x9B, 0x6E, 0xC1, 0xE2, 0xAD, 0xE1,
+        0xD6, 0x94, 0xF4, 0x1F, 0xC7, 0x1A, 0x83, 0x1D, 0x02, 0x68, 0xE9,
+        0x89, 0x15, 0x62, 0x11, 0x3D, 0x8A, 0x62, 0xAD, 0xD1, 0xBF,
+    };
+    static constexpr uint8_t kSignature[64] = {
+        0x5D, 0x5E, 0x79, 0x71, 0xBD, 0xE5, 0x28, 0x33, 0xBD, 0x53, 0x97,
+        0x91, 0x4C, 0x61, 0x6E, 0x64, 0x17, 0x5E, 0x47, 0xC0, 0xD8, 0x32,
+        0x99, 0x25, 0xD1, 0x6A, 0x3D, 0xC7, 0x2B, 0xF7, 0xC2, 0x0F,
+        0x7A, 0xEC, 0x33, 0x60, 0x16, 0x49, 0xF5, 0xA9, 0x5A, 0x19, 0x3A,
+        0x0F, 0x9D, 0xEB, 0x88, 0xF6, 0x5A, 0x18, 0x2A, 0x40, 0x07, 0x5B,
+        0xBD, 0x1E, 0x9B, 0x45, 0x1B, 0x0E, 0xE1, 0x96, 0xD9, 0x7E,
+    };
+    uint8_t randomness[32];
+    for (size_t index = 0; index < sizeof(randomness); ++index) {
+        randomness[index] = static_cast<uint8_t>(index);
+    }
+    uint8_t signature[64];
+    return signHedged(kScalar, kDigest, randomness, signature) &&
+           std::memcmp(signature, kSignature, sizeof(signature)) == 0;
+}
+
 class StoredPivCredential final : public deskid::PivCredential {
 public:
     ~StoredPivCredential() override {
@@ -335,6 +432,9 @@ public:
         if (psa_crypto_init() != PSA_SUCCESS) {
             return ESP_FAIL;
         }
+        // A failure leaves the board up, so the status object can say why it
+        // will not sign.
+        signingSelfTestPassed_ = signingSelfTest();
 
         nvs_handle_t handle;
         ESP_RETURN_ON_ERROR(nvs_open(kStorageNamespace, NVS_READWRITE, &handle),
@@ -347,6 +447,8 @@ public:
         nvs_close(handle);
         return result;
     }
+
+    bool signingSelfTestPassed() const { return signingSelfTestPassed_; }
 
     deskid::Bytes certificateDer(deskid::Slot slot) const override {
         if (slot == deskid::Slot::keyManagement) {
@@ -367,18 +469,25 @@ public:
         signatureLength = 0;
         if (digest.data == nullptr || digest.size != 32 ||
             signature == nullptr || capacity < 72 ||
-            keyId_ == PSA_KEY_ID_NULL) {
+            keyId_ == PSA_KEY_ID_NULL || !signingSelfTestPassed_) {
             return false;
         }
 
         uint8_t rawSignature[64];
-        size_t rawSignatureLength = 0;
+        uint8_t scalar[32];
+        uint8_t randomness[32];
+        size_t scalarLength = 0;
         const EntropySource entropy;
-        if (psa_sign_hash(keyId_, PSA_ALG_ECDSA(PSA_ALG_SHA_256),
-                          digest.data, digest.size, rawSignature,
-                          sizeof(rawSignature),
-                          &rawSignatureLength) != PSA_SUCCESS ||
-            rawSignatureLength != sizeof(rawSignature)) {
+        const bool succeeded =
+            psa_generate_random(randomness, sizeof(randomness)) ==
+                PSA_SUCCESS &&
+            psa_export_key(keyId_, scalar, sizeof(scalar), &scalarLength) ==
+                PSA_SUCCESS &&
+            scalarLength == sizeof(scalar) &&
+            signHedged(scalar, digest.data, randomness, rawSignature);
+        secureZero(scalar, sizeof(scalar));
+        secureZero(randomness, sizeof(randomness));
+        if (!succeeded) {
             secureZero(rawSignature, sizeof(rawSignature));
             return false;
         }
@@ -416,13 +525,16 @@ public:
             &attributes,
             PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
         psa_set_key_bits(&attributes, 256);
+        // The signing key is export only, like the one loadCredential
+        // imports: signHedged is the one signer. The key management key
+        // agrees keys through PSA, so it alone gets an algorithm.
         psa_set_key_usage_flags(
             &attributes,
-            (keyManagement ? PSA_KEY_USAGE_DERIVE : PSA_KEY_USAGE_SIGN_HASH) |
-                PSA_KEY_USAGE_EXPORT);
-        psa_set_key_algorithm(&attributes,
-                              keyManagement ? PSA_ALG_ECDH
-                                            : PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+            keyManagement ? PSA_KEY_USAGE_DERIVE | PSA_KEY_USAGE_EXPORT
+                          : PSA_KEY_USAGE_EXPORT);
+        if (keyManagement) {
+            psa_set_key_algorithm(&attributes, PSA_ALG_ECDH);
+        }
         const EntropySource entropy;
         const psa_status_t generateStatus =
             psa_generate_key(&attributes, &pending);
@@ -610,9 +722,9 @@ private:
             &attributes,
             PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
         psa_set_key_bits(&attributes, 256);
-        psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH);
-        psa_set_key_algorithm(&attributes,
-                              PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+        // PSA holds the key and hands it to signHedged. It gets no signing
+        // algorithm, so nothing can sign with a PSA-chosen nonce by mistake.
+        psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_EXPORT);
         const psa_status_t importStatus =
             psa_import_key(&attributes, scalar, sizeof(scalar), &keyId_);
         psa_reset_key_attributes(&attributes);
@@ -782,6 +894,7 @@ private:
     psa_key_id_t kmPendingKeyId_ = PSA_KEY_ID_NULL;
     uint32_t sensorPassword_ = 0;
     bool sensorProvisioned_ = false;
+    bool signingSelfTestPassed_ = false;
 };
 
 class R503Sensor {
@@ -1352,6 +1465,7 @@ public:
         value.secureRequests = deskid::ccidSecureRequests();
         value.earlyTouchGates = g_earlyTouch.gates();
         value.wakeLineBias = sensor_.wakeLineBias();
+        value.signingSelfTestPassed = credential_.signingSelfTestPassed();
         value.ringArmedSecondsRemaining = static_cast<uint8_t>(
             ringArmed() ? std::min<uint64_t>(
                               255, (g_ringArmedUntilMs - now + 999) / 1000)

@@ -10,6 +10,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - run: python3 tools/hedged_ecdsa_reference.py
       - run: pip install platformio
       - run: pio test -e native
 
