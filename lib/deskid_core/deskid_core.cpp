@@ -922,6 +922,45 @@ void EarlyTouch::clear() { expiresAtMilliseconds_ = 0; }
 
 uint32_t EarlyTouch::gates() const { return gates_; }
 
+void Autotype::arm(uint8_t seconds, uint64_t nowMilliseconds) {
+    const uint64_t capped =
+        seconds < kMaximumAutotypeSeconds ? seconds : kMaximumAutotypeSeconds;
+    armedUntilMilliseconds_ =
+        capped == 0 ? 0 : nowMilliseconds + capped * 1000;
+}
+
+uint8_t Autotype::secondsRemaining(uint64_t nowMilliseconds) const {
+    if (nowMilliseconds >= armedUntilMilliseconds_) {
+        return 0;
+    }
+    return static_cast<uint8_t>(
+        (armedUntilMilliseconds_ - nowMilliseconds + 999) / 1000);
+}
+
+bool Autotype::take(uint64_t nowMilliseconds) {
+    if (nowMilliseconds >= armedUntilMilliseconds_) {
+        return false;
+    }
+    armedUntilMilliseconds_ = 0;
+    ++emissions_;
+    return true;
+}
+
+uint32_t Autotype::emissions() const { return emissions_; }
+
+void Autotype::report(size_t index, uint8_t report[8]) {
+    // Keypad 1 to Keypad 6, then Return. HID sends key positions, and the top
+    // row is not digits under every layout (AZERTY wants Shift); the keypad
+    // is. Six digits because that is the shortest PIN a PIV VERIFY carries.
+    static constexpr uint8_t kKeys[] = {0x59, 0x5A, 0x5B, 0x5C,
+                                        0x5D, 0x5E, 0x28};
+    static_assert(kReportCount == 2 * sizeof(kKeys));
+    std::memset(report, 0, 8);
+    if (index % 2 == 0 && index / 2 < sizeof(kKeys)) {
+        report[2] = kKeys[index / 2];
+    }
+}
+
 void hedgedNonceSeed(const uint8_t randomness[32], const uint8_t scalar[32],
                      const uint8_t digest[32],
                      uint8_t seed[kHedgedNonceSeedSize]) {

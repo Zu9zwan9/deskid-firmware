@@ -19,6 +19,7 @@ The clip shows a locked Mac unlocking on one touch, in real time, on the first h
 - PIV application selection, Discovery, CCC, CHUID, certificate object `5FC105`, response chaining, `VERIFY`, and ECC P-256 `GENERAL AUTHENTICATE` for slot `9A`.
 - Host-driven authentication. macOS sends an APDU, CCID reports time extensions while the R503 waits, and a matching fingerprint releases the signature. The device sends no unsolicited APDU.
 - Touch first. The sensor is scanned between requests. A match is held for 30 s and can be spent once, by `VERIFY` or `GENERAL AUTHENTICATE`. See [Touch first](#touch-first).
+- Touch only, on development builds. A host arms the board, and after the next match the board types the PIN digits and Return itself over USB HID. See [Touch only](#touch-only).
 - A P-256 key and a matching X.509 certificate in NVS. The identity comes from a host image or is generated on the device (`GENERATE ASYMMETRIC KEY PAIR` `0x47` and `PUT DATA` `0xDB`).
 - ECDSA with a hedged nonce. See [Signature nonce](#signature-nonce).
 - A diagnostic channel over PC/SC, because this board has no serial console: a status object at `GET DATA 5FFF01`, and `80 F0 00 00 00` to reboot into ROM download mode without a BOOT press. On this board `80 F0` lands in USB-OTG DFU. See [Entering download mode](#entering-download-mode).
@@ -241,6 +242,35 @@ A rejected idle touch costs up to three rate-limiter attempts. The ring then sto
 
 The idle scan needs the blue wire. `WAKEUP` on `GPIO4` makes each idle poll a GPIO read at about 5 µA, and the firmware answers contact within 40 ms. The UART fallback is `GenImg`, and running it without a limit power-cycles the board (see [Fingerprint sensor wiring](#fingerprint-sensor-wiring)). Without a usable wake line the board scans with `GenImg` inside a bounded window: 20 s after the host selects the card, or up to 120 s after `80 E3`. `hw_smoke_test.py --status` reports `wake line (GPIO4)`. Touch the sensor and run it: `high` means the wire is good.
 
+### Touch only
+
+A development build can type the PIN for you. macOS still draws its PIN field, and the board fills it: after a fingerprint match it types six keypad digits and Return over USB HID, and the login instruction that follows spends that same match. The digits are a constant and unlock nothing. The applet ignores the PIN value and signs only after a match.
+
+The board presents three USB interfaces: the CCID reader, a keyboard, and a vendor HID interface for arming. It cannot see the screen, so a host tells it when a PIN field has the keyboard:
+
+```bash
+swift tools/deskid_arm.swift 10   # arm for 10 s, then touch the ring
+```
+
+Arming is a feature report on the vendor interface (usage page `0xFF00`, usage `1`, no report ID): `01`, then the seconds. Reading the report back returns `01`, the seconds the arming has left and the number of emissions since power-up.
+
+Four rules bound it:
+
+- Armed only. A match types nothing unless a host armed the board in the last 15 s (`kMaximumAutotypeSeconds`).
+- Single use. One arming types once, and zero seconds disarms.
+- A match is still required, from a touch that lands while the board is armed. A touch given earlier is never typed for, so one left behind cannot unlock a screen that locked after it.
+- Development builds only. `DESKID_ALLOW_AUTOTYPE` is set for `env:deskid`. Arming carries no authentication yet, so any local process can ask the board to type its constant after your next touch. A production image ignores the request.
+
+Each key is down for 30 ms and up for 30 ms (`kAutotypeReportMilliseconds`), about 0.4 s for the seven keys. `deskid::Autotype` holds the policy and `test/test_piv` tests it.
+
+What to expect from macOS:
+
+- Keyboard Setup Assistant opens the first time it meets a keyboard it does not recognise. Close it.
+- With Mouse Keys on, the keypad moves the pointer and no digits arrive.
+- A locked Apple silicon laptop can hold back a keyboard it has not approved. The setting is "Allow accessories to connect" in Privacy & Security.
+
+Status on 2026-11-13: both development images build and the policy tests pass. The typing has not run on a board yet. No helper arms the board on its own, so `tools/deskid_arm.swift` is the trigger.
+
 ### Guided setup
 
 ```bash
@@ -436,6 +466,7 @@ With enforcement on, unplugging DeskID no longer returns the Mac to password log
 - The R503 password is 32 bits. It stops accidental access and fails against a determined physical attack.
 - Host provisioning leaves a copy of the private key under manufacturing control. `tools/provision.py --on-device` generates the key on the board. The NVS packaging step is still needed for the R503 password.
 - `80 F0` reboots the device into ROM download mode. It requires a fingerprint match and is absent from production builds. On development builds one match is enough to replace the firmware.
+- A development build types a constant PIN after a match when a host arms it ([Touch only](#touch-only)). Arming is unauthenticated: local software can make the board type that constant into the front window after your next touch. It cannot make the board sign, which still takes the match. Production builds ignore arming.
 - Fingerprint templates stay inside the R503. `80 E1` enrolls without authorization while the sensor reports an empty library. Recovery from a lost finger needs a separate authenticated process, which does not exist yet.
 
 A high-assurance commercial device needs a reviewed secure element and a sensor link with cryptographic match attestation. The ESP32-S3 and R503 alone cannot give the physical-tamper guarantees of Touch ID.

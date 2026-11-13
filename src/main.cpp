@@ -107,6 +107,11 @@ constexpr uint32_t kIdleScanMilliseconds = 40;
 // is what browned the rail out, a minute at a time while someone is actually
 // logging in is not.
 constexpr uint32_t kArmedScanMilliseconds = 250;
+// How long each keyboard report stands before the next: a press and a release
+// per key, so a key takes twice this. A static password typed faster than
+// about 40 ms a key loses characters at the macOS login window (reports from
+// YubiKey users); tune it here if a board ever drops a digit.
+constexpr uint32_t kAutotypeReportMilliseconds = 30;
 constexpr uint8_t kMaximumArmSeconds = 120;
 // The R503's own default. Level 5 is the strictest of the five and was the
 // first choice here, but it rejected an enrolled finger often enough to be
@@ -1263,6 +1268,27 @@ uint8_t g_lastGateInstruction = 0;
 // A match that happened before any host asked for one. Reported through status
 // tags 0x11 and 0x12; the policy it enforces is tested in test/test_piv.
 deskid::EarlyTouch g_earlyTouch(kEarlyTouchValidMilliseconds);
+// Whether a host has asked for the PIN digits to be typed after the next
+// match. The policy is deskid::Autotype and is tested in test/test_piv.
+deskid::Autotype g_autotype;
+
+// Types the digits and Return. Blocking on purpose: whatever the host sends
+// meanwhile, a press is followed by its release, because a key left down
+// repeats until something else is typed. Unused in the sensorless bring-up
+// build, where no touch ever matches.
+[[maybe_unused]] void typeDummyPin() {
+    uint8_t report[8];
+    for (size_t index = 0; index < deskid::Autotype::kReportCount; ++index) {
+        deskid::Autotype::report(index, report);
+        if (!deskid::sendKeyboardReport(report)) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(kAutotypeReportMilliseconds));
+    }
+    // However the loop ended, nothing may stay pressed.
+    std::memset(report, 0, sizeof(report));
+    deskid::sendKeyboardReport(report);
+}
 
 // Owned by the idle scanner below, but also cleared by the gated path, which
 // drives the same ring and leaves the same finger resting on it.
@@ -1466,9 +1492,13 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
     }
     // One rejected match per touch, so a wallet resting on the ring costs the
     // rate limiter one attempt rather than a lockout. Holding a match already
-    // means there is nothing to gain from another.
+    // means there is nothing to gain from another, unless a host has since
+    // armed the board to type. Typing takes a touch that lands after the
+    // arming: a touch left behind earlier must not unlock a screen that
+    // locked after it.
     if (g_idleWaitForRemoval ||
-        g_earlyTouch.held(millisecondsSinceBoot())) {
+        (g_earlyTouch.held(millisecondsSinceBoot()) &&
+         g_autotype.secondsRemaining(millisecondsSinceBoot()) == 0)) {
         return;
     }
 
@@ -1489,7 +1519,13 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
             ledger.matched();
             g_earlyTouch.record(millisecondsSinceBoot());
             sensor.showSuccess();
-            vTaskDelay(pdMS_TO_TICKS(250));
+            // The touch is recorded first, so the login instruction the typed
+            // Return sets off finds it. Typing takes longer than the flash.
+            if (g_autotype.take(millisecondsSinceBoot())) {
+                typeDummyPin();
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(250));
+            }
             sensor.turnLedOff();
             g_idleRingLit = false;
             g_idleWaitForRemoval = true;
@@ -1750,6 +1786,19 @@ extern "C" void app_main() {
         if (!deskid::waitForCcidRequest(request, kIdleScanMilliseconds)) {
             // Nothing from the host, so the ring belongs to the user.
             const int64_t now = esp_timer_get_time();
+            uint8_t autotypeSeconds = 0;
+            if (deskid::takeAutotypeArm(autotypeSeconds)) {
+                const uint64_t nowMs = millisecondsSinceBoot();
+                g_autotype.arm(autotypeSeconds, nowMs);
+                // An armed board has to be watching its ring, wake line or
+                // not.
+                g_ringArmedUntilMs = std::max<uint64_t>(
+                    g_ringArmedUntilMs,
+                    nowMs + g_autotype.secondsRemaining(nowMs) * 1000ULL);
+            }
+            deskid::publishAutotypeStatus(
+                g_autotype.secondsRemaining(millisecondsSinceBoot()),
+                g_autotype.emissions());
             if (sensor.state() == 2 && now >= nextRecovery) {
                 nextRecovery = now + 2000000;
                 sensor.recover();

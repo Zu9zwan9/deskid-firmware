@@ -26,4 +26,17 @@ bool ccidRequestWasAborted(const CcidRequest &request);
 uint32_t ccidPowerEpoch();
 uint32_t ccidSecureRequests();
 
+// The HID side of the same USB device: a keyboard the board types the PIN
+// digits on, and a vendor interface a host arms that typing through. See
+// deskid::Autotype for the policy; these only move bytes.
+
+/// True when a host has sent an arming request since the last call. The USB
+/// task receives it and the main task acts on it.
+bool takeAutotypeArm(uint8_t &seconds);
+/// What the arming interface answers when a host reads it back.
+void publishAutotypeStatus(uint8_t secondsRemaining, uint32_t emissions);
+/// Sends one eight-byte keyboard report. False when the host is not taking
+/// them: suspended, not configured, or the interface refused.
+bool sendKeyboardReport(const uint8_t report[8]);
+
 }  // namespace deskid
