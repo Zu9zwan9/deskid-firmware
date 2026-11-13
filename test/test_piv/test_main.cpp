@@ -1380,6 +1380,84 @@ void test_wake_line_is_believed_after_both_levels_and_reads_its_touched_level() 
     TEST_ASSERT_FALSE(activeHigh.touched(false));
 }
 
+void test_one_match_opens_an_enrollment_session_for_one_template() {
+    selectApplet();
+    constexpr uint8_t enroll[] = {0x80, 0xE1, 0x00, 0x00, 0x00};
+    size_t responseLength = 0;
+    auto step = [&](bool userPresent) {
+        return applet.transceive(enroll, sizeof(enroll), userPresent,
+                                 response.data(), response.size(),
+                                 responseLength);
+    };
+    diagnostics.nowMilliseconds = 1000;
+    diagnostics.enrollStage = 0;
+    const size_t before = diagnostics.enrollRequests;
+
+    // An enrolled finger vouches for the new one, once.
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      step(false));
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete, step(true));
+    TEST_ASSERT_TRUE(applet.enrollmentOpen());
+
+    // Inside the session a step needs no match, so the finger on the ring
+    // can be one the sensor has never seen.
+    diagnostics.nowMilliseconds = 2000;
+    diagnostics.enrollStage = 2;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete, step(false));
+    TEST_ASSERT_EQUAL_UINT32(before + 2, diagnostics.enrollRequests);
+
+    // Storing the template ends it: one match pays for one template.
+    diagnostics.enrollStage = 3;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete, step(false));
+    TEST_ASSERT_FALSE(applet.enrollmentOpen());
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      step(false));
+}
+
+void test_enrollment_session_expires_and_ends_with_the_card_session() {
+    selectApplet();
+    constexpr uint8_t enroll[] = {0x80, 0xE1, 0x00, 0x00, 0x00};
+    size_t responseLength = 0;
+    auto step = [&](bool userPresent) {
+        return applet.transceive(enroll, sizeof(enroll), userPresent,
+                                 response.data(), response.size(),
+                                 responseLength);
+    };
+    diagnostics.nowMilliseconds = 1000;
+    diagnostics.enrollStage = 1;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete, step(true));
+    diagnostics.nowMilliseconds =
+        1000 + deskid::kEnrollmentSessionMilliseconds - 1;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete, step(false));
+    // A session nobody finished must not wait for whoever touches next.
+    diagnostics.nowMilliseconds = 1000 + deskid::kEnrollmentSessionMilliseconds;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      step(false));
+
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete, step(true));
+    applet.reset();
+    selectApplet();
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      step(false));
+}
+
+void test_a_declined_enrollment_opens_no_session() {
+    selectApplet();
+    diagnostics.enrollSupported = false;
+    diagnostics.nowMilliseconds = 1000;
+    constexpr uint8_t enroll[] = {0x80, 0xE1, 0x00, 0x00, 0x00};
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(enroll, sizeof(enroll), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+    diagnostics.enrollSupported = true;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(enroll, sizeof(enroll), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_selects_standard_piv_aid);
@@ -1430,5 +1508,8 @@ int main(int, char **) {
     RUN_TEST(test_autotype_fires_once_per_arming_and_only_inside_the_window);
     RUN_TEST(test_autotype_presses_and_releases_keypad_digits_then_return);
     RUN_TEST(test_wake_line_is_believed_after_both_levels_and_reads_its_touched_level);
+    RUN_TEST(test_one_match_opens_an_enrollment_session_for_one_template);
+    RUN_TEST(test_enrollment_session_expires_and_ends_with_the_card_session);
+    RUN_TEST(test_a_declined_enrollment_opens_no_session);
     return UNITY_END();
 }

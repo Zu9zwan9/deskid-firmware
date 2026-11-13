@@ -363,6 +363,11 @@ void PivApplet::reset() {
     selected_ = false;
     verified_ = false;
     verifiedAtMilliseconds_ = 0;
+    enrollmentOpenUntilMilliseconds_ = 0;
+}
+
+bool PivApplet::enrollmentOpen() const {
+    return diagnostics_.uptimeMilliseconds() < enrollmentOpenUntilMilliseconds_;
 }
 
 void PivApplet::drainPending(size_t requestedLength, uint8_t *response,
@@ -831,13 +836,29 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
         // Empty has to be something the sensor reported: an unknown count is
         // treated as a full library, because the alternative lets a sensor
         // that failed to answer at boot hand out free enrollment.
-        if (!libraryKnownEmpty() && !userPresent) {
+        //
+        // After that a new finger is vouched for by an old one, once. The
+        // match opens a session for a single template, and inside it the
+        // steps ask for no further match. They used to ask every time, and
+        // each image was then taken from the touch that had just matched, so
+        // the only finger that could be added was one the sensor already
+        // knew, lying where it already knew it.
+        const bool open = enrollmentOpen();
+        if (!libraryKnownEmpty() && !userPresent && !open) {
             return TransceiveStatus::userPresenceRequired;
         }
         uint8_t stage = 0;
         if (!diagnostics_.enrollStep(stage)) {
             status(0x6D00, response, responseCapacity, responseLength);
             return TransceiveStatus::complete;
+        }
+        if (stage == 0x03) {
+            // Stored. One match pays for one template.
+            enrollmentOpenUntilMilliseconds_ = 0;
+        } else if (userPresent && !open) {
+            enrollmentOpenUntilMilliseconds_ =
+                diagnostics_.uptimeMilliseconds() +
+                kEnrollmentSessionMilliseconds;
         }
         sendData(&stage, 1, apdu.expectedLength);
         return TransceiveStatus::complete;
