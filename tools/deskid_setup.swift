@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Maksym Bardakh. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-PolyForm-Strict-1.0.0
+// Source-available under LICENSE.md with the permissions in LICENSING.md.
+
 // Guided first-run setup for a DeskID token, in the shape macOS uses for
 // Touch ID: one thing per screen, a live picture of the sensor, and no step
 // that cannot be undone.

@@ -439,3 +439,12 @@ With enforcement on, unplugging DeskID no longer returns the Mac to password log
 - Fingerprint templates stay inside the R503. `80 E1` enrolls without authorization while the sensor reports an empty library. Recovery from a lost finger needs a separate authenticated process, which does not exist yet.
 
 A high-assurance commercial device needs a reviewed secure element and a sensor link with cryptographic match attestation. The ESP32-S3 and R503 alone cannot give the physical-tamper guarantees of Touch ID.
+
+## License
+
+DeskID is source-available under the PolyForm Strict License 1.0.0 with three additional permissions: device owners, evaluation and audit, private changes and security research. You may read, build and audit the code. Selling it, redistributing it or building a product on it needs a written license.
+
+- Terms in plain language: [LICENSING.md](LICENSING.md)
+- Binding license text: [LICENSE.md](LICENSE.md)
+- Components fetched at build time: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
+- Reporting a vulnerability: [SECURITY.md](SECURITY.md)

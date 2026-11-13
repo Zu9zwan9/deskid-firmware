@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Maksym Bardakh. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-PolyForm-Strict-1.0.0
+# Source-available under LICENSE.md with the permissions in LICENSING.md.
 """Reference for the ECDSA nonce DeskID signs with, in the standard library only.
 
 The firmware seeds an HMAC_DRBG with fresh randomness Z, the private scalar x

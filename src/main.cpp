@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Maksym Bardakh. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-PolyForm-Strict-1.0.0
+// Source-available under LICENSE.md with the permissions in LICENSING.md.
+
 #if defined(DESKID_PRODUCTION) && defined(DESKID_BRINGUP_NO_SENSOR)
 #error "DESKID_BRINGUP_NO_SENSOR must never reach a production image"
 #endif
