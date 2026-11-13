@@ -51,10 +51,17 @@ constexpr uint8_t kArmingInterface = 2;
 constexpr uint8_t kArmingInstance = 1;
 constexpr uint8_t kArmingEndpoint = 0x83;
 constexpr uint8_t kArmAutotypeCommand = 0x01;
+// The same request for a display that is asleep: a match taps the wake key
+// and the digits wait for the next ordinary arming. See deskid::Autotype.
+constexpr uint8_t kArmToWakeCommand = 0x02;
+// Fourth byte of the report a host reads back.
+constexpr uint8_t kStatusWakes = 0x01;           // understands kArmToWakeCommand
+constexpr uint8_t kStatusWatchesForFree = 0x02;  // the wake line is trusted
 constexpr size_t kEndpointSize = 64;
 constexpr size_t kHeaderSize = 10;
 constexpr size_t kMaximumMessageLength = 2048;
 constexpr uint16_t kPendingFlag = 0x100;
+constexpr uint16_t kToWakeFlag = 0x200;
 
 enum MessageType : uint8_t {
     kPcToReaderPowerOn = 0x62,
@@ -120,9 +127,10 @@ constexpr uint8_t kKeyboardReportDescriptor[] = {
 // interface into a single device, and opening a device whose first usage is a
 // keyboard needs the Input Monitoring permission. A vendor device does not.
 //
-// Feature report, host to board: 0x01, seconds. Board to host: 0x01, seconds
-// the arming has left, emissions since power-up. The input report exists
-// because a HID interface must have an interrupt IN endpoint; it is never sent.
+// Feature report, host to board: 0x01, seconds, or 0x02, seconds when the
+// display is asleep. Board to host: 0x01, seconds the arming has left,
+// emissions since power-up, status bits. The input report exists because a
+// HID interface must have an interrupt IN endpoint; it is never sent.
 constexpr uint8_t kArmingReportDescriptor[] = {
     0x06, 0x00, 0xFF,  // Usage Page (vendor 0xFF00)
     0x09, 0x01,        // Usage (1)
@@ -145,8 +153,10 @@ constexpr uint16_t kConfigurationLength = 86 + 2 * TUD_HID_DESC_LEN;
 // each, which is how a YubiKey presents the same three functions. Four IN
 // endpoints with endpoint 0, one under what the ESP32-S3 can keep active.
 constexpr uint8_t kConfigurationDescriptor[] = {
+    // Bus powered, and allowed to wake a sleeping host: a touch has to be
+    // able to do what a key press on a keyboard does.
     9, TUSB_DESC_CONFIGURATION, U16_TO_U8S_LE(kConfigurationLength), 3, 1, 0,
-    0x80, 100,
+    0x80 | TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100,
     9, TUSB_DESC_INTERFACE, kInterfaceNumber, 0, 2, TUSB_CLASS_SMART_CARD, 0, 0, 4,
     0x36, TUSB_DESC_FUNCTIONAL,
     0x10, 0x01,
@@ -209,9 +219,11 @@ std::atomic<uint16_t> s_pendingRequest{0};
 std::atomic<uint16_t> s_abortedRequest{0};
 // kPendingFlag marks a request the main task has not taken yet; the low byte
 // is the seconds asked for, and zero is a real request: it disarms.
+// kToWakeFlag marks a request made for a display that is asleep.
 std::atomic<uint16_t> s_autotypeArm{0};
 std::atomic<uint8_t> s_autotypeSecondsRemaining{0};
 std::atomic<uint8_t> s_autotypeEmissions{0};
+std::atomic<uint8_t> s_autotypeStatus{0};
 std::atomic<uint32_t> s_powerEpoch{0};
 std::atomic<uint32_t> s_secureRequests{0};
 char s_serialNumber[13] = {};
@@ -684,17 +696,25 @@ bool ccidRequestWasAborted(const CcidRequest &request) {
 uint32_t ccidPowerEpoch() { return s_powerEpoch.load(); }
 uint32_t ccidSecureRequests() { return s_secureRequests.load(); }
 
-bool takeAutotypeArm(uint8_t &seconds) {
+bool takeAutotypeArm(uint8_t &seconds, bool &toWake) {
     const uint16_t request = s_autotypeArm.exchange(0);
     seconds = static_cast<uint8_t>(request);
+    toWake = (request & kToWakeFlag) != 0;
     return (request & kPendingFlag) != 0;
 }
 
-void publishAutotypeStatus(uint8_t secondsRemaining, uint32_t emissions) {
+void publishAutotypeStatus(uint8_t secondsRemaining, uint32_t emissions,
+                           bool watchesForFree) {
     s_autotypeSecondsRemaining.store(secondsRemaining);
     s_autotypeEmissions.store(
         static_cast<uint8_t>(std::min<uint32_t>(emissions, 0xFF)));
+    s_autotypeStatus.store(static_cast<uint8_t>(
+        kStatusWakes | (watchesForFree ? kStatusWatchesForFree : 0)));
 }
+
+bool hostAsleep() { return tud_suspended(); }
+
+bool wakeHost() { return tud_suspended() && tud_remote_wakeup(); }
 
 bool sendKeyboardReport(const uint8_t report[8]) {
     // The endpoint is polled every 10 ms, so the previous report has gone
@@ -728,6 +748,9 @@ extern "C" uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t,
     buffer[0] = 0x01;
     buffer[1] = deskid::s_autotypeSecondsRemaining.load();
     buffer[2] = deskid::s_autotypeEmissions.load();
+#if defined(DESKID_ALLOW_AUTOTYPE)
+    buffer[3] = deskid::s_autotypeStatus.load();
+#endif
     return deskid::kArmingReportSize;
 }
 
@@ -739,8 +762,13 @@ extern "C" void tud_hid_set_report_cb(uint8_t instance, uint8_t,
     // included, is ignored. The seconds are capped where they are used.
     if (instance == deskid::kArmingInstance &&
         type == HID_REPORT_TYPE_FEATURE && length >= 2 &&
-        buffer[0] == deskid::kArmAutotypeCommand) {
-        deskid::s_autotypeArm.store(deskid::kPendingFlag | buffer[1]);
+        (buffer[0] == deskid::kArmAutotypeCommand ||
+         buffer[0] == deskid::kArmToWakeCommand)) {
+        deskid::s_autotypeArm.store(static_cast<uint16_t>(
+            deskid::kPendingFlag |
+            (buffer[0] == deskid::kArmToWakeCommand ? deskid::kToWakeFlag
+                                                    : 0) |
+            buffer[1]));
     }
 #else
     (void)instance;

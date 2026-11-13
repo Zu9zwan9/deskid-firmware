@@ -1024,11 +1024,31 @@ void EarlyTouch::clear() { expiresAtMilliseconds_ = 0; }
 
 uint32_t EarlyTouch::gates() const { return gates_; }
 
-void Autotype::arm(uint8_t seconds, uint64_t nowMilliseconds) {
+bool Autotype::arm(uint8_t seconds, uint64_t nowMilliseconds, bool toWake) {
     const uint64_t capped =
         seconds < kMaximumAutotypeSeconds ? seconds : kMaximumAutotypeSeconds;
-    armedUntilMilliseconds_ =
-        capped == 0 ? 0 : nowMilliseconds + capped * 1000;
+    const bool woken = nowMilliseconds < wokenUntilMilliseconds_;
+    if (capped == 0) {
+        armedUntilMilliseconds_ = 0;
+        forgetWoken();
+        return false;
+    }
+    if (woken && !toWake) {
+        // The match that woke the Mac is the one this arming is for, so the
+        // arming is spent on it and leaves nothing behind. The host's word
+        // is given once; after it the retype timer owns the match.
+        armedUntilMilliseconds_ = 0;
+        if (retypeAtMilliseconds_ != 0) {
+            return false;
+        }
+        retypeAtMilliseconds_ = nowMilliseconds + kRetypeMilliseconds;
+        retypesLeft_ = kMaximumRetypes;
+        ++emissions_;
+        return true;
+    }
+    armedUntilMilliseconds_ = nowMilliseconds + capped * 1000;
+    toWake_ = toWake;
+    return false;
 }
 
 uint8_t Autotype::secondsRemaining(uint64_t nowMilliseconds) const {
@@ -1044,11 +1064,49 @@ bool Autotype::take(uint64_t nowMilliseconds) {
         return false;
     }
     armedUntilMilliseconds_ = 0;
+    if (toWake_) {
+        // Nothing is typed yet, so nothing is counted yet.
+        wokeHost(nowMilliseconds);
+    } else {
+        ++emissions_;
+    }
+    return true;
+}
+
+bool Autotype::wakes() const { return toWake_; }
+
+void Autotype::wokeHost(uint64_t nowMilliseconds) {
+    wokenUntilMilliseconds_ = nowMilliseconds + kWokenMatchMilliseconds;
+    retypeAtMilliseconds_ = 0;
+    retypesLeft_ = 0;
+}
+
+bool Autotype::retype(uint64_t nowMilliseconds) {
+    if (nowMilliseconds >= wokenUntilMilliseconds_ ||
+        retypeAtMilliseconds_ == 0 || retypesLeft_ == 0 ||
+        nowMilliseconds < retypeAtMilliseconds_) {
+        return false;
+    }
+    --retypesLeft_;
+    retypeAtMilliseconds_ = nowMilliseconds + kRetypeMilliseconds;
     ++emissions_;
     return true;
 }
 
+void Autotype::hostActed() { forgetWoken(); }
+
+void Autotype::forgetWoken() {
+    wokenUntilMilliseconds_ = 0;
+    retypeAtMilliseconds_ = 0;
+    retypesLeft_ = 0;
+}
+
 uint32_t Autotype::emissions() const { return emissions_; }
+
+void Autotype::wakeReport(bool pressed, uint8_t report[8]) {
+    std::memset(report, 0, 8);
+    report[0] = pressed ? 0x02 : 0x00;  // Left Shift
+}
 
 void Autotype::report(size_t index, uint8_t report[8]) {
     // Keypad 1 to Keypad 6, then Return. HID sends key positions, and the top
