@@ -920,4 +920,14 @@ void EarlyTouch::clear() { expiresAtMilliseconds_ = 0; }
 
 uint32_t EarlyTouch::gates() const { return gates_; }
 
+WakeLine::WakeLine(bool touchedLevel) : touchedLevel_(touchedLevel) {}
+
+void WakeLine::observe(bool level) { seen_ |= level ? 0b10 : 0b01; }
+
+bool WakeLine::usable() const { return seen_ == 0b11; }
+
+bool WakeLine::touched(bool level) const {
+    return usable() && level == touchedLevel_;
+}
+
 }  // namespace deskid

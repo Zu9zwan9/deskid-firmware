@@ -989,6 +989,29 @@ void test_status_object_fits_the_longest_version_string() {
     TEST_ASSERT_EQUAL_HEX8(0x90, response[responseLength - 2]);
 }
 
+void test_wake_line_is_believed_after_both_levels_and_reads_its_touched_level() {
+    // The R503 holds WAKEUP high and drives it low for as long as a finger
+    // is on the ring.
+    deskid::WakeLine line(false);
+    line.observe(true);
+    TEST_ASSERT_FALSE(line.usable());
+    // A level that has never changed says nothing: it reads the same on a
+    // wire that was never soldered.
+    TEST_ASSERT_FALSE(line.touched(false));
+    line.observe(false);
+    TEST_ASSERT_TRUE(line.usable());
+    TEST_ASSERT_TRUE(line.touched(false));
+    // Resting high is an empty ring. Reading it as a finger is the fault
+    // this class was written after.
+    TEST_ASSERT_FALSE(line.touched(true));
+
+    deskid::WakeLine activeHigh(true);
+    activeHigh.observe(false);
+    activeHigh.observe(true);
+    TEST_ASSERT_TRUE(activeHigh.touched(true));
+    TEST_ASSERT_FALSE(activeHigh.touched(false));
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_selects_standard_piv_aid);
@@ -1027,5 +1050,6 @@ int main(int, char **) {
     RUN_TEST(test_enrollment_is_gated_while_the_template_count_is_unknown);
     RUN_TEST(test_verify_expires_instead_of_waiting_for_a_signature);
     RUN_TEST(test_status_object_fits_the_longest_version_string);
+    RUN_TEST(test_wake_line_is_believed_after_both_levels_and_reads_its_touched_level);
     return UNITY_END();
 }
