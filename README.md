@@ -241,7 +241,7 @@ Three rules bound the window:
 
 A rejected idle touch costs up to three rate-limiter attempts. The ring then stops looking until the finger lifts, so an object resting on the sensor cannot run the device into a lockout.
 
-The idle scan needs the blue wire. `WAKEUP` on `GPIO4` makes each idle poll a GPIO read at about 5 µA, and the firmware answers contact within 40 ms. The UART fallback is `GenImg`, and running it without a limit power-cycles the board (see [Fingerprint sensor wiring](#fingerprint-sensor-wiring)). Without a usable wake line the board scans with `GenImg` inside a bounded window: 20 s after the host selects the card, or up to 120 s after `80 E3`. `hw_smoke_test.py --status` reports `wake line (GPIO4)`: `high` with the ring empty and `low` under a finger means the wire is good.
+The idle scan needs the blue wire. `WAKEUP` on `GPIO4` makes each idle poll a GPIO read at about 5 µA, and the firmware answers contact within 40 ms. The UART fallback is `GenImg`, and running it without a limit power-cycles the board (see [Fingerprint sensor wiring](#fingerprint-sensor-wiring)). Without a usable wake line the board scans with `GenImg` inside a bounded window: 20 s after the host selects the card, or up to 120 s after `80 E3`. `hw_smoke_test.py --status` reports `wake line (GPIO4)`: `high` with the ring empty and `low` under a finger means the wire is good. Measured on 2026-11-13 with the line read the right way round: four touches given with no host request matched in 869 to 967 ms, and a 0.1 s tap cost no attempt.
 
 ### Touch only
 
@@ -266,11 +266,18 @@ Each key is down for 30 ms and up for 30 ms (`kAutotypeReportMilliseconds`), abo
 
 What to expect from macOS:
 
-- Keyboard Setup Assistant opens the first time it meets a keyboard it does not recognise. Close it.
+- Keyboard Setup Assistant can open the first time macOS meets a keyboard it does not recognise. Close it if it does.
 - With Mouse Keys on, the keypad moves the pointer and no digits arrive.
 - A locked Apple silicon laptop can hold back a keyboard it has not approved. The setting is "Allow accessories to connect" in Privacy & Security.
 
-Status on 2026-11-13: both development images build and the policy tests pass. The typing has not run on a board yet. No helper arms the board on its own, so `tools/deskid_arm.swift` is the trigger.
+Measured on 2026-11-13 on macOS 27.0.1, on a `deskid` board with an R503:
+
+- Armed, with a text editor in front: one touch typed `123456` and Return, 955 ms after contact.
+- Armed, with an administrator prompt in front: one touch authorized it. The prompt closed within 3 s of contact and the status object reported `answered by an earlier touch`.
+- Not armed: a touch matched and typed nothing.
+- The arming interface opened from a shell with no Input Monitoring request, and Keyboard Setup Assistant did not open.
+
+Not run yet: the lock screen, `sudo`, and an unenrolled finger while armed. No helper arms the board on its own, so `tools/deskid_arm.swift` is the trigger.
 
 ### Guided setup
 
