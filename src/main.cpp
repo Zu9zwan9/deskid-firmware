@@ -128,6 +128,14 @@ constexpr uint32_t kArmedScanMilliseconds = 250;
 // about 40 ms a key loses characters at the macOS login window (reports from
 // YubiKey users); tune it here if a board ever drops a digit.
 constexpr uint32_t kAutotypeReportMilliseconds = 30;
+// How long the digits wait once the host says a woken lock screen is lit.
+// The host goes by the display state, which leads the PIN field, and macOS
+// drops the first keys after a display wake (user reports on 15.2 and
+// 15.3.1). Tune it here if a board ever loses a digit after a wake.
+constexpr uint32_t kAutotypeLitMilliseconds = 400;
+// How long the board stays off the bus when a host asks it to reinsert
+// itself. Long enough for the host to see the reader go; a hand takes longer.
+constexpr uint32_t kReinsertMilliseconds = 500;
 constexpr uint8_t kMaximumArmSeconds = 120;
 // The R503's own default. Level 5 is the strictest of the five and was the
 // first choice here, but it rejected an enrolled finger often enough to be
@@ -143,6 +151,12 @@ constexpr uint8_t kFingerprintSecurityLevel = 3;
 // Shared by the gated wait and the idle scan — a single-shot idle match
 // rejects ordinary touches that the gated path would have accepted.
 constexpr int kRetriesPerTouch = 3;
+// How many readings of an empty ring in a row make the next finger a new
+// touch, for a request that takes only a touch made after it. The gate reads
+// the ring every 20 ms while it is empty. One empty reading is not enough: an
+// image that fails under a resting finger reads as empty too. Tune it here if
+// a board ever counts a resting finger or misses a quick second touch.
+constexpr uint8_t kFreshTouchEmptyReadings = 3;
 constexpr uint32_t kFingerprintFailureThreshold = 5;
 constexpr uint64_t kFingerprintBaseLockoutMilliseconds = 15000;
 constexpr uint64_t kFingerprintMaximumLockoutMilliseconds = 900000;
@@ -528,6 +542,23 @@ public:
         signature[1] = static_cast<uint8_t>(rLength + sLength);
         signatureLength = 2 + rLength + sLength;
         return true;
+    }
+
+    bool signMessageP256Sha256(deskid::Bytes message, uint8_t *signature,
+                               size_t capacity,
+                               size_t &signatureLength) override {
+        signatureLength = 0;
+        uint8_t digest[32];
+        size_t digestLength = 0;
+        if (message.data == nullptr ||
+            psa_hash_compute(PSA_ALG_SHA_256, message.data, message.size,
+                             digest, sizeof(digest),
+                             &digestLength) != PSA_SUCCESS ||
+            digestLength != sizeof(digest)) {
+            return false;
+        }
+        return signP256Sha256({digest, sizeof(digest)}, signature, capacity,
+                              signatureLength);
     }
 
     bool generateKeyP256(deskid::Slot slot, uint8_t *publicKey,
@@ -1193,6 +1224,10 @@ public:
     }
 
     void showWaiting() { setLed(0x01, 0x02, 0); }
+    // Cyan, breathing: not the look of a login. The colour is how the person
+    // at the ring tells "unlock" from "let a program act as administrator".
+    // Cyan needs a sensor with a green LED.
+    void showApproval() { setLed(0x01, 0x06, 0); }
     // The ring answers contact, not the match that follows it. Reading an
     // image takes a few hundred milliseconds and a dark sensor during them
     // reads as a sensor that missed the finger, so the light goes solid the
@@ -1464,6 +1499,25 @@ deskid::Autotype g_autotype;
     deskid::sendKeyboardReport(report);
 }
 
+// Wakes the Mac: its display, and the Mac itself when the bus is suspended.
+[[maybe_unused]] void wakeMac() {
+    // A sleeping Mac takes no key reports. It is woken the way a key press
+    // on a sleeping keyboard wakes it, and the tap that follows is the user
+    // activity that lights the display.
+    if (deskid::wakeHost()) {
+        for (int wait = 0; wait < 100 && deskid::hostAsleep(); ++wait) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+    uint8_t report[8];
+    deskid::Autotype::wakeReport(true, report);
+    if (deskid::sendKeyboardReport(report)) {
+        vTaskDelay(pdMS_TO_TICKS(kAutotypeReportMilliseconds));
+    }
+    deskid::Autotype::wakeReport(false, report);
+    deskid::sendKeyboardReport(report);
+}
+
 // Owned by the idle scanner below, but also cleared by the gated path, which
 // drives the same ring and leaves the same finger resting on it.
 // Until when the host has asked the board to watch its own sensor.
@@ -1650,6 +1704,15 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
         return;
     }
 
+    // Whether anyone asked for a touch: see deskid::idleRingListens.
+    const bool listens = deskid::idleRingListens(
+        g_autotype.secondsRemaining(millisecondsSinceBoot()),
+        deskid::hostAsleep());
+    if (!listens && !sensor.wakeLineUsable()) {
+        // Reading the ring costs an image on this board, and nobody asked.
+        return;
+    }
+
     // Two ways to know a finger is there, and the cheap one is only used when
     // the hardware has proved it works: see observeWakeLine(). Otherwise the
     // host has to say when it is worth spending an image capture on.
@@ -1659,6 +1722,16 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
         g_idleWaitForRemoval = false;
         g_idleTouchStartedAtUs = 0;
         g_idleRetriesThisTouch = 0;
+        if (g_idleRingLit) {
+            sensor.turnLedOff();
+            g_idleRingLit = false;
+        }
+        return;
+    }
+    // Nobody asked. A match now used to be held for whichever process asked
+    // the card first, so the ring stays dark and the sensor is asked nothing.
+    // The lift above is still seen, so the next asked-for touch is a new one.
+    if (!listens) {
         if (g_idleRingLit) {
             sensor.turnLedOff();
             g_idleRingLit = false;
@@ -1692,13 +1765,28 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
                 (esp_timer_get_time() - g_idleTouchStartedAtUs) / 1000);
             g_idleRetriesThisTouch = 0;
             ledger.matched();
-            g_earlyTouch.record(millisecondsSinceBoot());
             sensor.showSuccess();
-            // The touch is recorded first, so the login instruction the typed
-            // Return sets off finds it. Typing takes longer than the flash.
+            // The touch is recorded before anything is typed, so the login
+            // instruction the typed Return sets off finds it. Typing takes
+            // longer than the flash.
             if (g_autotype.take(millisecondsSinceBoot())) {
-                typeDummyPin();
+                g_earlyTouch.record(millisecondsSinceBoot());
+                if (g_autotype.wakes()) {
+                    // The digits follow when the host says the screen is lit.
+                    wakeMac();
+                } else {
+                    typeDummyPin();
+                }
+            } else if (deskid::hostAsleep()) {
+                // No helper runs on a Mac that is asleep, so nothing armed
+                // the board. A match still wakes it, and is held for the
+                // arming that follows once the lock screen is lit.
+                g_earlyTouch.record(millisecondsSinceBoot());
+                wakeMac();
+                g_autotype.wokeHost(millisecondsSinceBoot());
             } else {
+                // The arming ran out while the image was being read. Nobody
+                // is asking any more, so the match is not kept.
                 vTaskDelay(pdMS_TO_TICKS(250));
             }
             sensor.turnLedOff();
@@ -1750,6 +1838,12 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
     return true;
 #else
     g_lastGateInstruction = request.apduLength > 1 ? request.apdu[1] : 0;
+    // Only a submitted PIN field makes macOS ask for a login instruction, so
+    // digits typed for a match that woke the Mac have landed. Any process can
+    // send the other gated instructions, and they say nothing about a field.
+    if (deskid::EarlyTouch::maySpend(g_lastGateInstruction)) {
+        g_autotype.hostActed();
+    }
     g_lastGateOutcome = 2;
     // A touch that already happened answers the login instructions with no
     // wait at all. It is spent here whether or not what follows succeeds, so
@@ -1766,7 +1860,18 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
     // the ring and may have left a finger resting on it.
     g_idleWaitForRemoval = false;
     g_idleRingLit = false;
-    sensor.showWaiting();
+    // An approval takes only a touch that began after it was asked for, and
+    // asks in its own colour.
+    const bool fresh = deskid::demandsFreshTouch(g_lastGateInstruction);
+    deskid::FreshTouch freshTouch(kFreshTouchEmptyReadings);
+    auto showAsking = [&]() {
+        if (fresh) {
+            sensor.showApproval();
+        } else {
+            sensor.showWaiting();
+        }
+    };
+    showAsking();
     const int64_t deadline = esp_timer_get_time() +
                              kAuthenticationTimeoutMilliseconds * 1000LL;
     int64_t nextTimeExtension = esp_timer_get_time();
@@ -1788,13 +1893,21 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
             nextTimeExtension = now + 750000;
         }
 
-        if (!sensor.fingerPresent()) {
+        const bool present = sensor.fingerPresent();
+        const bool counts = fresh ? freshTouch.observe(present) : present;
+        if (!present) {
             fingerSeenAt = 0;
             retriesThisTouch = 0;
             if (waitForFingerRemoval) {
                 waitForFingerRemoval = false;
-                sensor.showWaiting();
+                showAsking();
             }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if (!counts) {
+            // The finger was there before the question. The ring keeps
+            // asking, no image is taken and no attempt is charged.
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
@@ -1962,18 +2075,35 @@ extern "C" void app_main() {
             // Nothing from the host, so the ring belongs to the user.
             const int64_t now = esp_timer_get_time();
             uint8_t autotypeSeconds = 0;
-            if (deskid::takeAutotypeArm(autotypeSeconds)) {
+            bool autotypeToWake = false;
+            if (deskid::takeAutotypeArm(autotypeSeconds, autotypeToWake)) {
                 const uint64_t nowMs = millisecondsSinceBoot();
-                g_autotype.arm(autotypeSeconds, nowMs);
+                if (g_autotype.arm(autotypeSeconds, nowMs, autotypeToWake)) {
+                    // A match woke the display, and the host now says the
+                    // lock screen is lit and still locked.
+                    vTaskDelay(pdMS_TO_TICKS(kAutotypeLitMilliseconds));
+                    typeDummyPin();
+                }
                 // An armed board has to be watching its ring, wake line or
                 // not.
                 g_ringArmedUntilMs = std::max<uint64_t>(
                     g_ringArmedUntilMs,
                     nowMs + g_autotype.secondsRemaining(nowMs) * 1000ULL);
             }
+            if (g_autotype.retype(millisecondsSinceBoot())) {
+                // The first digits met a display that was still coming up.
+                typeDummyPin();
+            }
+            if (deskid::takeReinsertRequest()) {
+                // The host has registered a new driver for the card. Whatever
+                // it armed belongs to the session that is about to end.
+                g_autotype.arm(0, millisecondsSinceBoot());
+                deskid::leaveAndRejoinBus(kReinsertMilliseconds);
+                continue;
+            }
             deskid::publishAutotypeStatus(
                 g_autotype.secondsRemaining(millisecondsSinceBoot()),
-                g_autotype.emissions());
+                g_autotype.emissions(), sensor.wakeLineUsable());
             if (sensor.state() == 2 && now >= nextRecovery) {
                 nextRecovery = now + 2000000;
                 sensor.recover();

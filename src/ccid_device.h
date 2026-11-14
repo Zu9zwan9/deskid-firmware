@@ -36,9 +36,25 @@ uint32_t ccidSecureRequests();
 
 /// True when a host has sent an arming request since the last call. The USB
 /// task receives it and the main task acts on it.
-bool takeAutotypeArm(uint8_t &seconds);
+bool takeAutotypeArm(uint8_t &seconds, bool &toWake);
 /// What the arming interface answers when a host reads it back.
-void publishAutotypeStatus(uint8_t secondsRemaining, uint32_t emissions);
+/// `watchesForFree` is the wake line being trusted: a host may then keep the
+/// board armed for as long as it likes, because watching costs no captures.
+void publishAutotypeStatus(uint8_t secondsRemaining, uint32_t emissions,
+                           bool watchesForFree);
+/// True when a host has asked for leaveAndRejoinBus() since the last call.
+bool takeReinsertRequest();
+/// Drops off the bus for `milliseconds` and returns, which a host reads as
+/// the card being pulled out and put back. macOS hands an inserted card only
+/// to the driver that was registered when it went in, so a host that has just
+/// registered a driver asks for this instead of asking a person to replug the
+/// board. Blocks the calling task for the whole time.
+void leaveAndRejoinBus(uint32_t milliseconds);
+/// True while the host has suspended the bus: the Mac is asleep.
+bool hostAsleep();
+/// Asks a sleeping host to wake, the way a key press on a sleeping keyboard
+/// does. False when the host is awake or did not let this device wake it.
+bool wakeHost();
 /// Sends one eight-byte keyboard report. False when the host is not taking
 /// them: suspended, not configured, or the interface refused.
 bool sendKeyboardReport(const uint8_t report[8]);

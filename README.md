@@ -19,7 +19,8 @@ The clip shows a locked Mac unlocking on one touch, in real time, on the first h
 - PIV application selection, Discovery, CCC, CHUID, certificate object `5FC105`, response chaining, `VERIFY`, and ECC P-256 `GENERAL AUTHENTICATE` for slot `9A`.
 - Slot `9D` key management in the firmware: its own key, certificate object `5FC10B`, and ECDH through `GENERAL AUTHENTICATE`, behind the same fingerprint gate. `tools/provision.py` and the token driver do not use it yet.
 - Host-driven authentication. macOS sends an APDU, CCID reports time extensions while the R503 waits, and a matching fingerprint releases the signature. The device sends no unsolicited APDU.
-- Touch first. The sensor is scanned between requests. A match is held for 30 s and can be spent once, by `VERIFY` or `GENERAL AUTHENTICATE`. See [Touch first](#touch-first).
+- Touch first. While a host has armed the board, or sleeps, the sensor is scanned between requests. A match is held for 30 s and can be spent once, by `VERIFY` or `GENERAL AUTHENTICATE`. See [Touch first](#touch-first).
+- Approval. `80 E4` asks the person at the ring to let a program act as administrator, and answers with a signature over a labelled request. Only a touch that begins after the request counts. See [Approval](#approval).
 - Touch only, on development builds. A host arms the board, and after the next match the board types the PIN digits and Return itself over USB HID. See [Touch only](#touch-only).
 - A P-256 key and a matching X.509 certificate in NVS. The identity comes from a host image or is generated on the device (`GENERATE ASYMMETRIC KEY PAIR` `0x47` and `PUT DATA` `0xDB`).
 - ECDSA with a hedged nonce. See [Signature nonce](#signature-nonce).
@@ -223,15 +224,18 @@ Release flash encryption and eFuse operations are irreversible. Follow Espressif
 
 macOS draws its own PIN field for a smart card at the lock screen and in `pam_smartcard`, and [no published setting removes it](#pin-prompt). DeskID cannot replace that field. It removes the waiting around it. The earlier sequence was: click the PIN field, type six digits, submit, watch the ring start breathing, reach for it, wait for the match.
 
-The firmware now scans the sensor between host requests. A match is kept for 30 s and spent by the next login instruction:
+The firmware scans the sensor between host requests while someone has asked for a touch. A match is kept for 30 s and spent by the next login instruction:
 
-1. Touch the sensor as you sit down. The ring turns solid blue on contact and matches in about 0.8 s.
-2. Type any digits and press Return.
-3. The card answers without waiting. Status tag `0x0E` reports that an earlier touch answered, and `0x11` counts those answers.
+1. A host arms the board ([Touch only](#touch-only)), or the Mac is asleep.
+2. Touch the sensor. The ring turns solid blue on contact and matches in about 0.8 s.
+3. The digits and Return follow, typed by the board or by hand.
+4. The card answers without waiting. Status tag `0x0E` reports that an earlier touch answered, and `0x11` counts those answers.
+
+With no arming and a Mac that is awake, the ring is dark and a touch is not read. Earlier firmware matched any idle touch and held it for the first process that asked the card, whoever that was. `deskid::idleRingListens` is the rule and `test/test_piv` tests it. The limit: arming is unauthenticated on development builds, so local software can still arm the board and wait for a touch. A production build takes no arming, so there a touch counts only at the gate and on a sleeping Mac.
 
 Measured at the lock screen on 2026-09-02, on a `deskid` board with an R503: an idle match took 749 ms from finger-on to confirmed, and `GENERAL AUTHENTICATE` returned in 0.2 s. The same request without an earlier touch ran 30 s of CCID time extensions.
 
-Without an earlier touch the ring starts breathing when the request arrives and waits up to 30 s for a finger.
+Without an earlier touch the ring starts breathing when the request arrives and waits up to 30 s for a finger. Press Return in the PIN field first, then touch.
 
 Three rules bound the window:
 
@@ -241,7 +245,40 @@ Three rules bound the window:
 
 A rejected idle touch costs up to three rate-limiter attempts. The ring then stops looking until the finger lifts, so an object resting on the sensor cannot run the device into a lockout.
 
-The idle scan needs the blue wire. `WAKEUP` on `GPIO4` makes each idle poll a GPIO read at about 5 µA, and the firmware answers contact within 40 ms. The UART fallback is `GenImg`, and running it without a limit power-cycles the board (see [Fingerprint sensor wiring](#fingerprint-sensor-wiring)). Without a usable wake line the board scans with `GenImg` inside a bounded window: 20 s after the host selects the card, or up to 120 s after `80 E3`. `hw_smoke_test.py --status` reports `wake line (GPIO4)`: `high` with the ring empty and `low` under a finger means the wire is good. Measured on 2026-11-13 with the line read the right way round: four touches given with no host request matched in 869 to 967 ms, and a 0.1 s tap cost no attempt.
+The idle scan needs the blue wire. `WAKEUP` on `GPIO4` makes each idle poll a GPIO read at about 5 µA, and the firmware answers contact within 40 ms. The UART fallback is `GenImg`, and running it without a limit power-cycles the board (see [Fingerprint sensor wiring](#fingerprint-sensor-wiring)). Without a usable wake line the board scans with `GenImg` only while a host has armed it to type ([Touch only](#touch-only)), at most 15 s an arming. Selecting the card (20 s) and `80 E3` (up to 120 s) still let the board poll, and no longer make a touch count by themselves. `hw_smoke_test.py --status` reports `wake line (GPIO4)`: `high` with the ring empty and `low` under a finger means the wire is good. Measured on 2026-11-13 with the line read the right way round: four touches given with no host request matched in 869 to 967 ms, and a 0.1 s tap cost no attempt.
+
+### Approval
+
+`sudo` asks a different question from a login: may this program act as administrator, now. `80 E4 01 00 20 <32 bytes> 00` puts that question to the person at the ring. P1 is the class of request, and `01`, administrator rights, is the only one. The 32 bytes are a number the asker draws at random.
+
+The ring breathes cyan, which no login does. After a match the card returns an ECDSA signature by the `9A` key over SHA-256 of
+
+```
+"DeskID PAM v1" || 00 || class || number
+```
+
+Four rules:
+
+- Nothing pays for it in advance. A `VERIFY` answered by a touch, the key agreement that touch bought and a match held from the idle ring are for logging in. This instruction reads none of them.
+- The touch has to begin after the request. A finger already on the ring is ignored until the ring has read empty three times in a row (`kFreshTouchEmptyReadings`), which takes 60 ms plus the three readings. `deskid::FreshTouch` holds the rule.
+- It buys one signature. The next login signature, key agreement or approval asks for its own touch.
+- The card builds and hashes the message. `GENERAL AUTHENTICATE` signs any digest a host hands it with the same key, so the signature proves a touch only to a verifier that drew the number at random and showed it to nobody else. A PAM module inside `sudo` is such a verifier. A value the asker reuses or publishes proves nothing.
+
+The board does not know which program asked. Showing that is the host's job.
+
+`test/test_piv` covers the instruction, the message and the policy rules.
+
+Measured on 2026-11-13 on a `deskid` board with an R503 and macOS 27.0.1, one run each, with `deskidctl approve` from the macOS repository as the asker:
+
+- The firmware before this instruction answered `6D00`.
+- A touch after the request: the signature verified against the board's certificate 12.3 s after the request. The time includes the person reading what to do.
+- A finger on the ring before the request, then lifted and placed again: verified after 8.8 s.
+- A finger held on the ring for the whole 30 s: refused with `6982`, and the status object showed no failed match.
+- A touch with nothing armed and the Mac awake: the ring stayed dark.
+- The lock screen, with the helper arming the board: one touch unlocked the Mac, as it did before.
+- The lock screen with the display asleep, same helper: a touch unlocked the Mac.
+
+Not measured: the match time by itself, the look on a sensor without a green LED, and a sleeping Mac on this firmware.
 
 ### Touch only
 
@@ -253,7 +290,9 @@ The board presents three USB interfaces: the CCID reader, a keyboard, and a vend
 swift tools/deskid_arm.swift 10   # arm for 10 s, then touch the ring
 ```
 
-Arming is a feature report on the vendor interface (usage page `0xFF00`, usage `1`, no report ID): `01`, then the seconds. Reading the report back returns `01`, the seconds the arming has left and the number of emissions since power-up.
+Arming is a feature report on the vendor interface (usage page `0xFF00`, usage `1`, no report ID): `01`, then the seconds. `02`, then the seconds, is the same request for a display that is asleep. Reading the report back returns `01`, the seconds the arming has left, the number of emissions since power-up and a status byte. Bit 0 of the status is set when the board understands `02`. Bit 1 is set when the wake line is trusted, so watching the ring costs no image captures and a host may keep the board armed. Bit 2 is set when the board understands `03`.
+
+`03` asks the board to leave the bus for half a second and come back. macOS hands an inserted card only to the driver that was registered when the card went in. After a driver is registered or updated the card stays dead for the system until it is reinserted: a prompt answers "SmartCard initialization error" and the lock screen ignores a touch, while direct access to the reader keeps working (measured three times on 2026-11-13). A host that has just registered a driver sends `03` and the board reinserts itself. The request ends any arming.
 
 Four rules bound it:
 
@@ -263,6 +302,12 @@ Four rules bound it:
 - Development builds only. `DESKID_ALLOW_AUTOTYPE` is set for `env:deskid`. Arming carries no authentication yet, so any local process can ask the board to type its constant after your next touch. A production image ignores the request.
 
 Each key is down for 30 ms and up for 30 ms (`kAutotypeReportMilliseconds`), about 0.4 s for the seven keys. `deskid::Autotype` holds the policy and `test/test_piv` tests it.
+
+Keys sent into a dark lock screen are lost. Armed with `02`, a match taps Left Shift and types nothing. The display wakes, the host sees a lit screen that is still locked and arms with `01`, and that arming types the digits 400 ms later (`kAutotypeLitMilliseconds`). The match waits 10 s for it (`kWokenMatchMilliseconds`). Zero seconds drops the match, so a Mac that something else unlocked in between gets no digits.
+
+macOS drops keys while a display comes up and reports nothing. Measured on 2026-11-13 on macOS 27.0.1 with an external monitor: the wake tap lit the display, digits typed 0.6 s to 1.0 s after it were lost, and the display took keys 2.0 s after the tap. So the digits are typed again every 2.2 s (`kRetypeMilliseconds`), at most twice (`kMaximumRetypes`), until the host asks the card for a private-key operation, which only a submitted PIN field causes.
+
+A Mac that is fully asleep suspends the bus and runs no helper, so nothing arms the board. A match then signals remote wakeup, taps Left Shift once the bus resumes, and is held for the `01` arming the same way. The configuration descriptor sets the remote wakeup bit for this. A board whose wake line is not trusted does not watch its ring while the Mac sleeps and cannot wake it.
 
 What to expect from macOS:
 
@@ -277,7 +322,9 @@ Measured on 2026-11-13 on macOS 27.0.1, on a `deskid` board with an R503:
 - Not armed: a touch matched and typed nothing.
 - The arming interface opened from a shell with no Input Monitoring request, and Keyboard Setup Assistant did not open.
 
-Not run yet: the lock screen, `sudo`, and an unenrolled finger while armed. No helper arms the board on its own, so `tools/deskid_arm.swift` is the trigger.
+- At the lock screen, with the card paired and a host process arming the board while the screen was locked and lit: one touch unlocked the Mac. The signature took 220 ms and the key agreement that followed took 201 ms.
+
+Not run yet: `sudo`, an unenrolled finger while armed, the `02` request on a sleeping display, and waking a Mac that is asleep. This repository has no helper that arms the board on its own, so `tools/deskid_arm.swift` is the trigger.
 
 ### Guided setup
 
@@ -474,7 +521,8 @@ With enforcement on, unplugging DeskID no longer returns the Mac to password log
 - The R503 password is 32 bits. It stops accidental access and fails against a determined physical attack.
 - Host provisioning leaves a copy of the private key under manufacturing control. `tools/provision.py --on-device` generates the key on the board. The NVS packaging step is still needed for the R503 password.
 - `80 F0` reboots the device into ROM download mode. It requires a fingerprint match and is absent from production builds. On development builds one match is enough to replace the firmware.
-- A development build types a constant PIN after a match when a host arms it ([Touch only](#touch-only)). Arming is unauthenticated: local software can make the board type that constant into the front window after your next touch. It cannot make the board sign, which still takes the match. Production builds ignore arming.
+- A development build types a constant PIN after a match when a host arms it ([Touch only](#touch-only)). Arming is unauthenticated: local software can make the board type that constant into the front window after your next touch. It cannot make the board sign, which still takes the match. The reinsert request is unauthenticated too: local software can take the reader off the bus for half a second, as often as it likes. Production builds ignore both.
+- `80 E4` tells the card what is being approved by class alone. Any local process can send it, and the person at the ring sees a colour and no name. A host that wants the name shown has to show it.
 - Fingerprint templates stay inside the R503. `80 E1` enrolls without authorization while the sensor reports an empty library. Recovery from a lost finger needs a separate authenticated process, which does not exist yet.
 
 A high-assurance commercial device needs a reviewed secure element and a sensor link with cryptographic match attestation. The ESP32-S3 and R503 alone cannot give the physical-tamper guarantees of Touch ID.

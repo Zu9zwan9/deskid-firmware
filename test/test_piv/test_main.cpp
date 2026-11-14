@@ -29,6 +29,7 @@ public:
         generatedKeys = 0;
         generatedKeyManagementKeys = 0;
         agreements = 0;
+        signedMessageLength = 0;
     }
 
     void forget() { certificateLength_ = 0; }
@@ -56,6 +57,24 @@ public:
         if (digest.size != 32 || capacity < sizeof(value)) {
             return false;
         }
+        std::memcpy(signature, value, sizeof(value));
+        signatureLength = sizeof(value);
+        return true;
+    }
+
+    // Stands in for hashing and signing a message: keeps the message, and
+    // answers with a signature no digest path returns.
+    bool signMessageP256Sha256(deskid::Bytes message, uint8_t *signature,
+                               size_t capacity,
+                               size_t &signatureLength) override {
+        constexpr uint8_t value[] = {0x30, 0x06, 0x02, 0x01,
+                                     0x03, 0x02, 0x01, 0x04};
+        signatureLength = 0;
+        if (message.size > signedMessage.size() || capacity < sizeof(value)) {
+            return false;
+        }
+        std::memcpy(signedMessage.data(), message.data, message.size);
+        signedMessageLength = message.size;
         std::memcpy(signature, value, sizeof(value));
         signatureLength = sizeof(value);
         return true;
@@ -110,6 +129,8 @@ public:
     size_t generatedKeys = 0;
     size_t generatedKeyManagementKeys = 0;
     size_t agreements = 0;
+    std::array<uint8_t, 64> signedMessage{};
+    size_t signedMessageLength = 0;
 
 private:
     std::array<uint8_t, 300> certificate_{};
@@ -1328,6 +1349,120 @@ void test_autotype_fires_once_per_arming_and_only_inside_the_window() {
     TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
 }
 
+void test_autotype_to_wake_taps_first_and_types_when_the_host_says_lit() {
+    deskid::Autotype autotype;
+    autotype.arm(10, 1000, true);
+    TEST_ASSERT_TRUE(autotype.take(2000));
+    // The caller taps the wake key. No digits yet, so no emission yet.
+    TEST_ASSERT_TRUE(autotype.wakes());
+    TEST_ASSERT_EQUAL_UINT32(0, autotype.emissions());
+
+    // The display is still dark and the host renews: the match keeps waiting.
+    TEST_ASSERT_FALSE(autotype.arm(10, 2500, true));
+    // The host sees the lock screen lit: this arming is the word to type,
+    // and it is spent on that.
+    TEST_ASSERT_TRUE(autotype.arm(10, 3000));
+    TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
+    TEST_ASSERT_FALSE(autotype.take(3500));
+    // The word is given once. A second arming types nothing more.
+    TEST_ASSERT_FALSE(autotype.arm(10, 3600));
+    TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
+}
+
+void test_autotype_types_again_until_the_host_acts() {
+    deskid::Autotype autotype;
+    autotype.arm(10, 1000, true);
+    TEST_ASSERT_TRUE(autotype.take(2000));
+    // Nothing is typed again before the host's word.
+    TEST_ASSERT_FALSE(autotype.retype(2000 + deskid::kRetypeMilliseconds));
+    TEST_ASSERT_TRUE(autotype.arm(10, 3000));
+
+    // The display was still coming up and macOS dropped the digits.
+    TEST_ASSERT_FALSE(autotype.retype(3000 + deskid::kRetypeMilliseconds - 1));
+    TEST_ASSERT_TRUE(autotype.retype(3000 + deskid::kRetypeMilliseconds));
+    TEST_ASSERT_EQUAL_UINT32(2, autotype.emissions());
+    // These landed: macOS asked the card to sign. Nothing more is typed.
+    autotype.hostActed();
+    TEST_ASSERT_FALSE(autotype.retype(60000));
+    TEST_ASSERT_EQUAL_UINT32(2, autotype.emissions());
+}
+
+void test_autotype_stops_typing_into_a_mac_that_never_answers() {
+    deskid::Autotype autotype;
+    autotype.wokeHost(1000);
+    TEST_ASSERT_TRUE(autotype.arm(10, 2000));
+    uint64_t now = 2000;
+    uint32_t retypes = 0;
+    for (int tick = 0; tick < 200; ++tick) {
+        now += 100;
+        if (autotype.retype(now)) {
+            ++retypes;
+        }
+    }
+    // An unpaired Mac takes the digits as a wrong password, so this is
+    // bounded, and it ends with the woken match at the latest.
+    TEST_ASSERT_TRUE(retypes <= deskid::kMaximumRetypes);
+    TEST_ASSERT_EQUAL_UINT32(1 + retypes, autotype.emissions());
+
+    // A host that disarms stops it at once.
+    autotype.wokeHost(50000);
+    TEST_ASSERT_TRUE(autotype.arm(10, 51000));
+    autotype.arm(0, 51500);
+    TEST_ASSERT_FALSE(autotype.retype(51000 + deskid::kRetypeMilliseconds));
+}
+
+void test_autotype_forgets_a_woken_match_nobody_claimed() {
+    deskid::Autotype autotype;
+    // Something else unlocked the Mac after the wake tap: the host disarms.
+    autotype.arm(10, 1000, true);
+    TEST_ASSERT_TRUE(autotype.take(2000));
+    autotype.arm(0, 2500);
+    TEST_ASSERT_FALSE(autotype.arm(10, 3000));
+    TEST_ASSERT_TRUE(autotype.take(3500));
+    TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
+
+    // The host said nothing in time: the touch is not typed for.
+    autotype.arm(10, 10000, true);
+    TEST_ASSERT_TRUE(autotype.take(11000));
+    TEST_ASSERT_FALSE(
+        autotype.arm(10, 11000 + deskid::kWokenMatchMilliseconds));
+    TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
+}
+
+void test_autotype_types_for_a_match_that_woke_a_sleeping_host() {
+    deskid::Autotype autotype;
+    // Nobody armed the board: the host was asleep. The match woke it.
+    autotype.wokeHost(1000);
+    TEST_ASSERT_EQUAL_UINT32(0, autotype.emissions());
+    // The host is up, sees a lit lock screen and arms: that is the word.
+    TEST_ASSERT_TRUE(autotype.arm(10, 4000));
+    TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
+
+    // A Mac that woke unlocked never arms, and the match lapses.
+    autotype.wokeHost(20000);
+    TEST_ASSERT_FALSE(
+        autotype.arm(10, 20000 + deskid::kWokenMatchMilliseconds));
+    // One that disarms drops it at once.
+    autotype.wokeHost(40000);
+    autotype.arm(0, 41000);
+    TEST_ASSERT_FALSE(autotype.arm(10, 42000));
+}
+
+void test_autotype_wake_tap_is_left_shift_alone() {
+    uint8_t report[8];
+    std::memset(report, 0xAA, sizeof(report));
+    deskid::Autotype::wakeReport(true, report);
+    TEST_ASSERT_EQUAL_UINT8(0x02, report[0]);
+    for (size_t slot = 1; slot < sizeof(report); ++slot) {
+        TEST_ASSERT_EQUAL_UINT8(0, report[slot]);
+    }
+    std::memset(report, 0xAA, sizeof(report));
+    deskid::Autotype::wakeReport(false, report);
+    for (size_t slot = 0; slot < sizeof(report); ++slot) {
+        TEST_ASSERT_EQUAL_UINT8(0, report[slot]);
+    }
+}
+
 void test_autotype_presses_and_releases_keypad_digits_then_return() {
     uint32_t digits = 0;
     for (size_t index = 0; index < deskid::Autotype::kReportCount; ++index) {
@@ -1380,6 +1515,176 @@ void test_wake_line_is_believed_after_both_levels_and_reads_its_touched_level() 
     TEST_ASSERT_FALSE(activeHigh.touched(false));
 }
 
+// 80 E4 <class> 00 20 <number> 00: what a PAM module sends when sudo asks.
+std::array<uint8_t, 38> approvalRequest(uint8_t requestClass = 0x01) {
+    std::array<uint8_t, 38> request = {0x80, 0xE4, requestClass, 0x00, 0x20};
+    for (size_t index = 0; index < 32; ++index) {
+        request[5 + index] = static_cast<uint8_t>(0xC0 + index);
+    }
+    return request;
+}
+
+void test_an_approval_waits_for_a_touch_and_signs_the_labelled_request() {
+    selectApplet();
+    const auto request = approvalRequest();
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(request.data(), request.size(), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(0, responseLength);
+    TEST_ASSERT_EQUAL_UINT32(0, credential.signedMessageLength);
+
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(request.data(), request.size(), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+    constexpr uint8_t expected[] = {0x30, 0x06, 0x02, 0x01, 0x03,
+                                    0x02, 0x01, 0x04, 0x90, 0x00};
+    TEST_ASSERT_EQUAL_UINT32(sizeof(expected), responseLength);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, response.data(), sizeof(expected));
+
+    // The card hashes the label, a zero, the class and the number itself. A
+    // host that could hand this path a digest could have it sign a login.
+    std::array<uint8_t, 47> message{};
+    std::memcpy(message.data(), "DeskID PAM v1", 13);
+    message[14] = 0x01;
+    std::memcpy(message.data() + 15, request.data() + 5, 32);
+    TEST_ASSERT_EQUAL_UINT32(message.size(), credential.signedMessageLength);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(message.data(),
+                                  credential.signedMessage.data(),
+                                  message.size());
+}
+
+void test_an_approval_is_never_paid_for_in_advance() {
+    selectApplet();
+    // A PIN answered by a touch unlocks the next login signature.
+    constexpr uint8_t verify[] = {
+        0x00, 0x20, 0x00, 0x80, 0x08, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(verify, sizeof(verify), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+    // It unlocks no approval.
+    const auto request = approvalRequest();
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(request.data(), request.size(), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL_UINT32(0, credential.signedMessageLength);
+
+    // Nor does a touch the idle ring took before anyone asked.
+    deskid::EarlyTouch touch(30000);
+    touch.record(1000);
+    TEST_ASSERT_FALSE(deskid::EarlyTouch::maySpend(0xE4));
+    TEST_ASSERT_FALSE(touch.spend(0xE4, 2000));
+    TEST_ASSERT_TRUE(touch.held(2000));
+}
+
+void test_an_approval_buys_nothing_else() {
+    selectApplet();
+    const auto request = approvalRequest();
+    size_t responseLength = 0;
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                      applet.transceive(request.data(), request.size(), true,
+                                        response.data(), response.size(),
+                                        responseLength));
+
+    // No login signature, no key agreement and no second approval.
+    std::array<uint8_t, 44> authenticate = {
+        0x00, 0x87, 0x11, 0x9A, 0x26, 0x7C, 0x24, 0x82, 0x00, 0x81, 0x20,
+    };
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(authenticate.data(), authenticate.size(),
+                                        false, response.data(), response.size(),
+                                        responseLength));
+    const auto agreement = keyAgreementRequest();
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(agreement.data(), agreement.size(),
+                                        false, response.data(), response.size(),
+                                        responseLength));
+    TEST_ASSERT_EQUAL(deskid::TransceiveStatus::userPresenceRequired,
+                      applet.transceive(request.data(), request.size(), false,
+                                        response.data(), response.size(),
+                                        responseLength));
+}
+
+void test_an_approval_refuses_what_it_cannot_sign_without_waiting() {
+    selectApplet();
+    size_t responseLength = 0;
+    auto expectStatus = [&](const uint8_t *apdu, size_t length,
+                            uint16_t expected) {
+        TEST_ASSERT_EQUAL(deskid::TransceiveStatus::complete,
+                          applet.transceive(apdu, length, false,
+                                            response.data(), response.size(),
+                                            responseLength));
+        TEST_ASSERT_EQUAL_UINT32(2, responseLength);
+        TEST_ASSERT_EQUAL_HEX16(expected, static_cast<uint16_t>(
+                                              response[0] << 8 | response[1]));
+    };
+
+    // A class the board has no look for.
+    const auto unknownClass = approvalRequest(0x02);
+    expectStatus(unknownClass.data(), unknownClass.size(), 0x6A86);
+    // A number one byte short.
+    auto shortNumber = approvalRequest();
+    shortNumber[4] = 0x1F;
+    expectStatus(shortNumber.data(), shortNumber.size() - 1, 0x6700);
+    // The instruction under the interindustry class.
+    auto wrongClass = approvalRequest();
+    wrongClass[0] = 0x00;
+    expectStatus(wrongClass.data(), wrongClass.size(), 0x6A86);
+
+    // A board with no identity has nothing to sign with, and says so at once.
+    credential.forget();
+    const auto request = approvalRequest();
+    expectStatus(request.data(), request.size(), 0x6A88);
+    TEST_ASSERT_EQUAL_UINT32(0, credential.signedMessageLength);
+}
+
+void test_a_touch_is_fresh_only_after_the_ring_was_seen_empty() {
+    deskid::FreshTouch touch(3);
+    // A finger that was resting there when the request came.
+    TEST_ASSERT_FALSE(touch.observe(true));
+    TEST_ASSERT_FALSE(touch.observe(true));
+    // One empty reading can be a capture that failed under that finger.
+    TEST_ASSERT_FALSE(touch.observe(false));
+    TEST_ASSERT_FALSE(touch.observe(true));
+    TEST_ASSERT_FALSE(touch.observe(false));
+    TEST_ASSERT_FALSE(touch.observe(false));
+    TEST_ASSERT_FALSE(touch.observe(true));
+
+    // Lifted for three readings in a row, then placed.
+    TEST_ASSERT_FALSE(touch.observe(false));
+    TEST_ASSERT_FALSE(touch.observe(false));
+    TEST_ASSERT_FALSE(touch.observe(false));
+    TEST_ASSERT_TRUE(touch.observe(true));
+    TEST_ASSERT_TRUE(touch.observe(true));
+    // A rejected finger that lifts and tries again is still fresh.
+    TEST_ASSERT_FALSE(touch.observe(false));
+    TEST_ASSERT_TRUE(touch.observe(true));
+}
+
+void test_only_an_approval_demands_a_fresh_touch() {
+    TEST_ASSERT_TRUE(deskid::demandsFreshTouch(0xE4));
+    // The rest keep the gate they had: a finger already on the ring counts.
+    TEST_ASSERT_FALSE(deskid::demandsFreshTouch(0x20));
+    TEST_ASSERT_FALSE(deskid::demandsFreshTouch(0x87));
+    TEST_ASSERT_FALSE(deskid::demandsFreshTouch(0xE1));
+}
+
+void test_the_idle_ring_listens_only_for_an_armed_host_or_a_sleeping_one() {
+    // Nobody asked: a match now would wait for whichever process asks first.
+    TEST_ASSERT_FALSE(deskid::idleRingListens(0, false));
+    // The helper said a PIN field has the keyboard, or the display is dark.
+    TEST_ASSERT_TRUE(deskid::idleRingListens(1, false));
+    // A sleeping Mac runs no helper, and the touch is what wakes it.
+    TEST_ASSERT_TRUE(deskid::idleRingListens(0, true));
+}
+
 int main(int, char **) {
     UNITY_BEGIN();
     RUN_TEST(test_selects_standard_piv_aid);
@@ -1428,7 +1733,20 @@ int main(int, char **) {
     RUN_TEST(test_hedged_nonce_seed_reduces_a_digest_at_or_above_the_group_order);
     RUN_TEST(test_status_object_reports_a_failed_signing_self_test);
     RUN_TEST(test_autotype_fires_once_per_arming_and_only_inside_the_window);
+    RUN_TEST(test_autotype_to_wake_taps_first_and_types_when_the_host_says_lit);
+    RUN_TEST(test_autotype_types_again_until_the_host_acts);
+    RUN_TEST(test_autotype_stops_typing_into_a_mac_that_never_answers);
+    RUN_TEST(test_autotype_forgets_a_woken_match_nobody_claimed);
+    RUN_TEST(test_autotype_types_for_a_match_that_woke_a_sleeping_host);
+    RUN_TEST(test_autotype_wake_tap_is_left_shift_alone);
     RUN_TEST(test_autotype_presses_and_releases_keypad_digits_then_return);
     RUN_TEST(test_wake_line_is_believed_after_both_levels_and_reads_its_touched_level);
+    RUN_TEST(test_an_approval_waits_for_a_touch_and_signs_the_labelled_request);
+    RUN_TEST(test_an_approval_is_never_paid_for_in_advance);
+    RUN_TEST(test_an_approval_buys_nothing_else);
+    RUN_TEST(test_an_approval_refuses_what_it_cannot_sign_without_waiting);
+    RUN_TEST(test_a_touch_is_fresh_only_after_the_ring_was_seen_empty);
+    RUN_TEST(test_only_an_approval_demands_a_fresh_touch);
+    RUN_TEST(test_the_idle_ring_listens_only_for_an_armed_host_or_a_sleeping_one);
     return UNITY_END();
 }

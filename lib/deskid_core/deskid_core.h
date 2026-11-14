@@ -30,6 +30,12 @@ public:
     virtual Bytes deviceIdentifier() const = 0;
     virtual bool signP256Sha256(Bytes digest, uint8_t *signature, size_t capacity,
                                size_t &signatureLength) = 0;
+    /// The same signature over SHA-256 of `message`, hashed on the card. The
+    /// digest path signs whatever 32 bytes a host hands it. This one is for
+    /// a request whose wording the card itself has to vouch for.
+    virtual bool signMessageP256Sha256(Bytes message, uint8_t *signature,
+                                       size_t capacity,
+                                       size_t &signatureLength) = 0;
     /// ECDH with the key management key. `peerPoint` is an uncompressed
     /// P-256 point; the result is the shared X coordinate, 32 bytes. Must
     /// refuse a point that is not on the curve.
@@ -51,6 +57,38 @@ constexpr uint8_t kArmOnSelectSeconds = 20;
 /// bound a card left selected holds a signature in reserve for whichever
 /// process asks first, hours later.
 constexpr uint64_t kVerifiedValidMilliseconds = 30000;
+
+/// APPROVE, 80 E4 <class> 00 20 <number>: a program asks the person at the
+/// ring to let something through. The answer is a signature by the 9A key
+/// over SHA-256 of
+///
+///     "DeskID PAM v1" || 0x00 || class || number
+///
+/// The class is what is being asked for. It picks the ring's look and is
+/// signed, so an approval of one thing cannot pass for another. There is one
+/// so far: a program wants administrator rights, which is sudo.
+constexpr uint8_t kApproveInstruction = 0xE4;
+constexpr uint8_t kApprovalAdministrator = 0x01;
+constexpr size_t kApprovalNumberSize = 32;
+constexpr char kApprovalLabel[] = "DeskID PAM v1";
+
+/// An approval answers "may this program do that, now". A finger that was on
+/// the ring before the question is no answer to it, so the gate behind this
+/// instruction counts a touch only after it has seen the ring empty. The
+/// other gated instructions keep the gate they had.
+constexpr bool demandsFreshTouch(uint8_t instruction) {
+    return instruction == kApproveInstruction;
+}
+
+/// Whether the idle ring is read at all. A match nobody asked for used to be
+/// held for whichever process asked first. Now the ring listens while a host
+/// has armed the board, which is its helper saying a PIN field has the
+/// keyboard or the display is dark, and while the host sleeps, when no helper
+/// runs and the touch is what wakes it. A request at the gate lights the
+/// ring by itself and needs none of this.
+constexpr bool idleRingListens(uint8_t armedSeconds, bool hostAsleep) {
+    return armedSeconds > 0 || hostAsleep;
+}
 
 struct DeviceStatus {
     const char *firmwareVersion = "";
@@ -263,6 +301,25 @@ private:
     uint32_t gates_ = 0;
 };
 
+// A touch that began after it was asked for.
+//
+// Fed every reading of the ring while a request waits. A finger counts once
+// the ring has been empty for `emptyReadings` readings in a row since the
+// request came: one empty reading can be an image that failed under a
+// resting finger, and must not turn that finger into a new touch.
+class FreshTouch {
+public:
+    explicit FreshTouch(uint8_t emptyReadings);
+
+    /// True while a finger that landed after the ring was seen empty is on it.
+    bool observe(bool fingerPresent);
+
+private:
+    uint8_t emptyReadings_;
+    uint8_t emptyRun_ = 0;
+    bool seenEmpty_ = false;
+};
+
 /// The longest a host may ask the board to type for it. Long enough to reach
 /// the ring after a prompt appears, short enough that an arming nobody used
 /// has lapsed before another window takes the keyboard.
@@ -284,20 +341,67 @@ public:
     /// Reports in one emission: a press and a release for each key.
     static constexpr size_t kReportCount = 14;
 
-    /// Zero seconds disarms.
-    void arm(uint8_t seconds, uint64_t nowMilliseconds);
+    /// Zero seconds disarms, and forgets a match that is waiting for a lit
+    /// screen.
+    ///
+    /// `toWake` is the host saying the display is asleep. Keys sent into a
+    /// dark lock screen are lost, so a match under such an arming taps the
+    /// wake key and waits. The host's next ordinary arming says the lock
+    /// screen is lit and still locked, and this returns true: the caller
+    /// types. The board never guesses how long a display takes to wake, and
+    /// a Mac that something else unlocked meanwhile gets no digits.
+    bool arm(uint8_t seconds, uint64_t nowMilliseconds, bool toWake = false);
     uint8_t secondsRemaining(uint64_t nowMilliseconds) const;
-    /// True once per arming, inside its window. The caller then types.
+    /// True once per arming, inside its window. The caller then types, or
+    /// taps the wake key when wakes() says so.
     bool take(uint64_t nowMilliseconds);
+    /// Whether the arming last taken was to wake.
+    bool wakes() const;
+    /// A match that woke a sleeping host. Nothing can be in front of a Mac
+    /// that is asleep, so this needs no arming. The digits still wait for
+    /// the host to say its lock screen is lit.
+    void wokeHost(uint64_t nowMilliseconds);
+    /// True when digits typed for a match that woke the Mac got no answer and
+    /// are due again. macOS drops keys for a couple of seconds while a
+    /// display comes up, and says nothing. What proves they landed is the
+    /// host asking the card for a private-key operation: see hostActed().
+    bool retype(uint64_t nowMilliseconds);
+    /// The host asked the card for something only a login asks for, so the
+    /// digits landed and nothing more is typed.
+    void hostActed();
     uint32_t emissions() const;
 
     /// The `index`-th eight-byte keyboard report of an emission.
     static void report(size_t index, uint8_t report[8]);
+    /// The wake tap: Left Shift alone, which wakes a display and types
+    /// nothing if the field is already there.
+    static void wakeReport(bool pressed, uint8_t report[8]);
 
 private:
     uint64_t armedUntilMilliseconds_ = 0;
+    void forgetWoken();
+
+    uint64_t wokenUntilMilliseconds_ = 0;
+    /// Zero until the host has given its word for the woken match.
+    uint64_t retypeAtMilliseconds_ = 0;
     uint32_t emissions_ = 0;
+    uint8_t retypesLeft_ = 0;
+    bool toWake_ = false;
 };
+
+/// How long digits typed for a woken match wait for the host to act before
+/// they are typed again, counted from the host's word. Typing takes 0.8 s of
+/// it. A display with an external monitor took 2.0 s from the wake tap to
+/// taking keys (measured 2026-11-13, macOS 27.0.1).
+constexpr uint32_t kRetypeMilliseconds = 2200;
+/// Typed again at most this often. If the Mac is not paired with the card,
+/// the digits are a wrong password each time.
+constexpr uint8_t kMaximumRetypes = 2;
+
+/// How long a match that woke the Mac waits for the host to say the lock
+/// screen is lit. A display lights in under a second and a Mac takes a few
+/// to come out of sleep. Past it the touch is not typed for.
+constexpr uint32_t kWokenMatchMilliseconds = 10000;
 
 // The R503's touch-sense output, as far as it can be believed.
 //

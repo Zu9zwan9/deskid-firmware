@@ -1064,14 +1064,14 @@ struct DoneScreen: View {
                         + "which you can do any time from the previous step.")
 
             VStack(alignment: .leading, spacing: 13) {
-                Hint("touchid", "Touch the sensor as you sit down.",
-                     "The ring is live before macOS asks anything. A match is held "
-                     + "for \(Int(Device.earlyTouchWindow)) seconds and spent by the "
-                     + "next prompt, so the prompt is answered the moment you submit it.")
-                Hint("keyboard", "Then type any digits and press Return.",
+                Hint("keyboard", "Press Return in the PIN field.",
                      "macOS draws a PIN field for every smart card and no public "
                      + "setting removes it. DeskID ignores what you type — your "
                      + "fingerprint is the secret.")
+                Hint("touchid", "Then touch the sensor.",
+                     "The ring lights when macOS asks and waits "
+                     + "\(Int(Device.earlyTouchWindow)) seconds for your finger. "
+                     + "It reads a touch only when something asked for one.")
                 Hint("bolt.horizontal", "Nothing held? Touch it then.",
                      "The ring starts breathing when a request is waiting, and gives "
                      + "up after \(Int(Device.presenceTimeout)) seconds without a match.")
