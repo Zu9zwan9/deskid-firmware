@@ -54,9 +54,12 @@ constexpr uint8_t kArmAutotypeCommand = 0x01;
 // The same request for a display that is asleep: a match taps the wake key
 // and the digits wait for the next ordinary arming. See deskid::Autotype.
 constexpr uint8_t kArmToWakeCommand = 0x02;
+// Leave the bus and come back. See leaveAndRejoinBus().
+constexpr uint8_t kReinsertCommand = 0x03;
 // Fourth byte of the report a host reads back.
 constexpr uint8_t kStatusWakes = 0x01;           // understands kArmToWakeCommand
 constexpr uint8_t kStatusWatchesForFree = 0x02;  // the wake line is trusted
+constexpr uint8_t kStatusReinserts = 0x04;       // understands kReinsertCommand
 constexpr size_t kEndpointSize = 64;
 constexpr size_t kHeaderSize = 10;
 constexpr size_t kMaximumMessageLength = 2048;
@@ -221,6 +224,7 @@ std::atomic<uint16_t> s_abortedRequest{0};
 // is the seconds asked for, and zero is a real request: it disarms.
 // kToWakeFlag marks a request made for a display that is asleep.
 std::atomic<uint16_t> s_autotypeArm{0};
+std::atomic<bool> s_reinsertAsked{false};
 std::atomic<uint8_t> s_autotypeSecondsRemaining{0};
 std::atomic<uint8_t> s_autotypeEmissions{0};
 std::atomic<uint8_t> s_autotypeStatus{0};
@@ -709,7 +713,16 @@ void publishAutotypeStatus(uint8_t secondsRemaining, uint32_t emissions,
     s_autotypeEmissions.store(
         static_cast<uint8_t>(std::min<uint32_t>(emissions, 0xFF)));
     s_autotypeStatus.store(static_cast<uint8_t>(
-        kStatusWakes | (watchesForFree ? kStatusWatchesForFree : 0)));
+        kStatusWakes | kStatusReinserts |
+        (watchesForFree ? kStatusWatchesForFree : 0)));
+}
+
+bool takeReinsertRequest() { return s_reinsertAsked.exchange(false); }
+
+void leaveAndRejoinBus(uint32_t milliseconds) {
+    tud_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(milliseconds));
+    tud_connect();
 }
 
 bool hostAsleep() { return tud_suspended(); }
@@ -769,6 +782,11 @@ extern "C" void tud_hid_set_report_cb(uint8_t instance, uint8_t,
             (buffer[0] == deskid::kArmToWakeCommand ? deskid::kToWakeFlag
                                                     : 0) |
             buffer[1]));
+    }
+    if (instance == deskid::kArmingInstance &&
+        type == HID_REPORT_TYPE_FEATURE && length >= 1 &&
+        buffer[0] == deskid::kReinsertCommand) {
+        deskid::s_reinsertAsked.store(true);
     }
 #else
     (void)instance;

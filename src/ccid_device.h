@@ -42,6 +42,14 @@ bool takeAutotypeArm(uint8_t &seconds, bool &toWake);
 /// board armed for as long as it likes, because watching costs no captures.
 void publishAutotypeStatus(uint8_t secondsRemaining, uint32_t emissions,
                            bool watchesForFree);
+/// True when a host has asked for leaveAndRejoinBus() since the last call.
+bool takeReinsertRequest();
+/// Drops off the bus for `milliseconds` and returns, which a host reads as
+/// the card being pulled out and put back. macOS hands an inserted card only
+/// to the driver that was registered when it went in, so a host that has just
+/// registered a driver asks for this instead of asking a person to replug the
+/// board. Blocks the calling task for the whole time.
+void leaveAndRejoinBus(uint32_t milliseconds);
 /// True while the host has suspended the bus: the Mac is asleep.
 bool hostAsleep();
 /// Asks a sleeping host to wake, the way a key press on a sleeping keyboard

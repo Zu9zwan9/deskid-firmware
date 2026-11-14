@@ -133,6 +133,9 @@ constexpr uint32_t kAutotypeReportMilliseconds = 30;
 // drops the first keys after a display wake (user reports on 15.2 and
 // 15.3.1). Tune it here if a board ever loses a digit after a wake.
 constexpr uint32_t kAutotypeLitMilliseconds = 400;
+// How long the board stays off the bus when a host asks it to reinsert
+// itself. Long enough for the host to see the reader go; a hand takes longer.
+constexpr uint32_t kReinsertMilliseconds = 500;
 constexpr uint8_t kMaximumArmSeconds = 120;
 // The R503's own default. Level 5 is the strictest of the five and was the
 // first choice here, but it rejected an enrolled finger often enough to be
@@ -2018,6 +2021,13 @@ extern "C" void app_main() {
             if (g_autotype.retype(millisecondsSinceBoot())) {
                 // The first digits met a display that was still coming up.
                 typeDummyPin();
+            }
+            if (deskid::takeReinsertRequest()) {
+                // The host has registered a new driver for the card. Whatever
+                // it armed belongs to the session that is about to end.
+                g_autotype.arm(0, millisecondsSinceBoot());
+                deskid::leaveAndRejoinBus(kReinsertMilliseconds);
+                continue;
             }
             deskid::publishAutotypeStatus(
                 g_autotype.secondsRemaining(millisecondsSinceBoot()),
