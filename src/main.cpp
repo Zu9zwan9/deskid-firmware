@@ -1061,7 +1061,14 @@ public:
     // same kind of broken: it reports a finger on an empty ring, so the gate
     // never sees the ring released and refuses a second touch until it times
     // out.
+    //
+    // Every look at the ring is also a look at the wake line. The line is
+    // believed once it has been seen at both levels, and the idle loop alone
+    // used to do the looking. A first touch that answered a request never
+    // counted, so after power-on the board could not watch a dark lock screen
+    // until a touch had been spent on nothing (bench, 2026-11-13 20:34).
     bool fingerPresent() {
+        observeWakeLine();
         if (wakeLineTouched()) {
             return true;
         }
