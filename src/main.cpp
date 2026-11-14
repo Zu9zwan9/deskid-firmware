@@ -155,6 +155,12 @@ constexpr int64_t kEnrollSettleMilliseconds = 300;
 // single-shot idle match rejects ordinary touches that the gated path would
 // have accepted.
 constexpr int kRetriesPerTouch = deskid::kVerdictsPerTouch;
+// How many readings of an empty ring in a row make the next finger a new
+// touch, for a request that takes only a touch made after it. The gate reads
+// the ring every 20 ms while it is empty. One empty reading is not enough: an
+// image that fails under a resting finger reads as empty too. Tune it here if
+// a board ever counts a resting finger or misses a quick second touch.
+constexpr uint8_t kFreshTouchEmptyReadings = 3;
 constexpr uint32_t kFingerprintFailureThreshold = 5;
 constexpr uint64_t kFingerprintBaseLockoutMilliseconds = 15000;
 constexpr uint64_t kFingerprintMaximumLockoutMilliseconds = 900000;
@@ -540,6 +546,23 @@ public:
         signature[1] = static_cast<uint8_t>(rLength + sLength);
         signatureLength = 2 + rLength + sLength;
         return true;
+    }
+
+    bool signMessageP256Sha256(deskid::Bytes message, uint8_t *signature,
+                               size_t capacity,
+                               size_t &signatureLength) override {
+        signatureLength = 0;
+        uint8_t digest[32];
+        size_t digestLength = 0;
+        if (message.data == nullptr ||
+            psa_hash_compute(PSA_ALG_SHA_256, message.data, message.size,
+                             digest, sizeof(digest),
+                             &digestLength) != PSA_SUCCESS ||
+            digestLength != sizeof(digest)) {
+            return false;
+        }
+        return signP256Sha256({digest, sizeof(digest)}, signature, capacity,
+                              signatureLength);
     }
 
     bool generateKeyP256(deskid::Slot slot, uint8_t *publicKey,
@@ -1246,6 +1269,7 @@ public:
     enum class Ring : uint8_t {
         off,
         waiting,       // a host asked for a touch
+        approval,      // a program asked for administrator rights
         touched,       // contact, image being read
         success,
         failure,       // the touch was rejected
@@ -1279,6 +1303,9 @@ public:
     bool showing(Ring ring) const { return ring_ == ring; }
 
     void showWaiting() { show(Ring::waiting); }
+    // Not the look of a login: the colour is how the person at the ring
+    // tells "unlock" from "let a program act as administrator".
+    void showApproval() { show(Ring::approval); }
     // The ring answers contact, not the match that follows it. Reading an
     // image takes a few hundred milliseconds and a dark sensor during them
     // reads as a sensor that missed the finger, so the light goes solid the
@@ -1517,6 +1544,7 @@ private:
     static constexpr RingLook kRingLooks[] = {
         {0x04, 0x02, 0},     // off
         {0x01, 0x07, 0},     // waiting: white, breathing
+        {0x01, 0x06, 0},     // approval: cyan, breathing
         {0x03, 0x02, 0},     // touched: blue
         {0x03, 0x04, 700},   // success: green
         {0x02, 0x01, 1300},  // failure: red, flashing
@@ -1791,6 +1819,15 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
         return;
     }
 
+    // Whether anyone asked for a touch: see deskid::idleRingListens.
+    const bool listens = deskid::idleRingListens(
+        g_autotype.secondsRemaining(millisecondsSinceBoot()),
+        deskid::hostAsleep());
+    if (!listens && !sensor.wakeLineUsable()) {
+        // Reading the ring costs an image on this board, and nobody asked.
+        return;
+    }
+
     // Two ways to know a finger is there, and the cheap one is only used when
     // the hardware has proved it works: see observeWakeLine(). Otherwise the
     // host has to say when it is worth spending an image capture on.
@@ -1825,6 +1862,16 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
         }
         return;
     }
+    // Nobody asked. A match now used to be held for whichever process asked
+    // the card first, so the ring stays dark and the sensor is asked nothing.
+    // The lift above is still seen, so the next asked-for touch is a new one.
+    if (!listens) {
+        if (g_idleRingLit) {
+            sensor.turnLedOff();
+            g_idleRingLit = false;
+        }
+        return;
+    }
     // One rejected match per touch, so a wallet resting on the ring costs the
     // rate limiter one attempt rather than a lockout. Holding a match already
     // means there is nothing to gain from another, unless a host has since
@@ -1852,11 +1899,11 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
                 (esp_timer_get_time() - g_idleTouchStartedAtUs) / 1000);
             g_idleRetriesThisTouch = 0;
             ledger.matched();
-            g_earlyTouch.record(millisecondsSinceBoot());
             sensor.showSuccess();
-            // The touch is recorded first, so the login instruction the typed
-            // Return sets off finds it.
+            // The touch is recorded before anything is typed, so the login
+            // instruction the typed Return sets off finds it.
             if (g_autotype.take(millisecondsSinceBoot())) {
+                g_earlyTouch.record(millisecondsSinceBoot());
                 if (g_autotype.wakes()) {
                     // The digits follow when the host says the screen is lit.
                     wakeMac();
@@ -1867,6 +1914,7 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
                 // No helper runs on a Mac that is asleep, so nothing armed
                 // the board. A match still wakes it, and is held for the
                 // arming that follows once the lock screen is lit.
+                g_earlyTouch.record(millisecondsSinceBoot());
                 wakeMac();
                 g_autotype.wokeHost(millisecondsSinceBoot());
             }
@@ -1922,9 +1970,12 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
     return true;
 #else
     g_lastGateInstruction = request.apduLength > 1 ? request.apdu[1] : 0;
-    // Only a submitted PIN field makes macOS ask for this, so digits typed
-    // for a match that woke the Mac have landed.
-    g_autotype.hostActed();
+    // Only a submitted PIN field makes macOS ask for a login instruction, so
+    // digits typed for a match that woke the Mac have landed. Any process can
+    // send the other gated instructions, and they say nothing about a field.
+    if (deskid::EarlyTouch::maySpend(g_lastGateInstruction)) {
+        g_autotype.hostActed();
+    }
     g_lastGateOutcome = 2;
     // A touch that already happened answers the login instructions with no
     // wait at all. It is spent here whether or not what follows succeeds, so
@@ -1941,7 +1992,18 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
     // the ring and may have left a finger resting on it.
     g_idleWaitForRemoval = false;
     g_idleRingLit = false;
-    sensor.showWaiting();
+    // An approval takes only a touch that began after it was asked for, and
+    // asks in its own colour.
+    const bool fresh = deskid::demandsFreshTouch(g_lastGateInstruction);
+    deskid::FreshTouch freshTouch(kFreshTouchEmptyReadings);
+    auto showAsking = [&]() {
+        if (fresh) {
+            sensor.showApproval();
+        } else {
+            sensor.showWaiting();
+        }
+    };
+    showAsking();
     const int64_t deadline = esp_timer_get_time() +
                              kAuthenticationTimeoutMilliseconds * 1000LL;
     int64_t nextTimeExtension = esp_timer_get_time();
@@ -1964,15 +2026,23 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
             nextTimeExtension = now + 750000;
         }
 
-        if (!sensor.fingerPresent()) {
+        const bool present = sensor.fingerPresent();
+        const bool counts = fresh ? freshTouch.observe(present) : present;
+        if (!present) {
             ledger.touchEnded();
             fingerSeenAt = 0;
             retriesThisTouch = 0;
             waitForFingerRemoval = false;
             // Breathing again, once a rejection has had its flash.
             if (!sensor.ringBusy()) {
-                sensor.showWaiting();
+                showAsking();
             }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if (!counts) {
+            // The finger was there before the question. The ring keeps
+            // asking, no image is taken and no attempt is charged.
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
