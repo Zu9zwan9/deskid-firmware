@@ -30,6 +30,12 @@ public:
     virtual Bytes deviceIdentifier() const = 0;
     virtual bool signP256Sha256(Bytes digest, uint8_t *signature, size_t capacity,
                                size_t &signatureLength) = 0;
+    /// The same signature over SHA-256 of `message`, hashed on the card. The
+    /// digest path signs whatever 32 bytes a host hands it. This one is for
+    /// a request whose wording the card itself has to vouch for.
+    virtual bool signMessageP256Sha256(Bytes message, uint8_t *signature,
+                                       size_t capacity,
+                                       size_t &signatureLength) = 0;
     /// ECDH with the key management key. `peerPoint` is an uncompressed
     /// P-256 point; the result is the shared X coordinate, 32 bytes. Must
     /// refuse a point that is not on the curve.
@@ -51,6 +57,38 @@ constexpr uint8_t kArmOnSelectSeconds = 20;
 /// bound a card left selected holds a signature in reserve for whichever
 /// process asks first, hours later.
 constexpr uint64_t kVerifiedValidMilliseconds = 30000;
+
+/// APPROVE, 80 E4 <class> 00 20 <number>: a program asks the person at the
+/// ring to let something through. The answer is a signature by the 9A key
+/// over SHA-256 of
+///
+///     "DeskID PAM v1" || 0x00 || class || number
+///
+/// The class is what is being asked for. It picks the ring's look and is
+/// signed, so an approval of one thing cannot pass for another. There is one
+/// so far: a program wants administrator rights, which is sudo.
+constexpr uint8_t kApproveInstruction = 0xE4;
+constexpr uint8_t kApprovalAdministrator = 0x01;
+constexpr size_t kApprovalNumberSize = 32;
+constexpr char kApprovalLabel[] = "DeskID PAM v1";
+
+/// An approval answers "may this program do that, now". A finger that was on
+/// the ring before the question is no answer to it, so the gate behind this
+/// instruction counts a touch only after it has seen the ring empty. The
+/// other gated instructions keep the gate they had.
+constexpr bool demandsFreshTouch(uint8_t instruction) {
+    return instruction == kApproveInstruction;
+}
+
+/// Whether the idle ring is read at all. A match nobody asked for used to be
+/// held for whichever process asked first. Now the ring listens while a host
+/// has armed the board, which is its helper saying a PIN field has the
+/// keyboard or the display is dark, and while the host sleeps, when no helper
+/// runs and the touch is what wakes it. A request at the gate lights the
+/// ring by itself and needs none of this.
+constexpr bool idleRingListens(uint8_t armedSeconds, bool hostAsleep) {
+    return armedSeconds > 0 || hostAsleep;
+}
 
 struct DeviceStatus {
     const char *firmwareVersion = "";
@@ -261,6 +299,25 @@ private:
     uint64_t validMilliseconds_;
     uint64_t expiresAtMilliseconds_ = 0;
     uint32_t gates_ = 0;
+};
+
+// A touch that began after it was asked for.
+//
+// Fed every reading of the ring while a request waits. A finger counts once
+// the ring has been empty for `emptyReadings` readings in a row since the
+// request came: one empty reading can be an image that failed under a
+// resting finger, and must not turn that finger into a new touch.
+class FreshTouch {
+public:
+    explicit FreshTouch(uint8_t emptyReadings);
+
+    /// True while a finger that landed after the ring was seen empty is on it.
+    bool observe(bool fingerPresent);
+
+private:
+    uint8_t emptyReadings_;
+    uint8_t emptyRun_ = 0;
+    bool seenEmpty_ = false;
 };
 
 /// The longest a host may ask the board to type for it. Long enough to reach

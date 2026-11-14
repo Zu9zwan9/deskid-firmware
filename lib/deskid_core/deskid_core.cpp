@@ -436,9 +436,9 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
         }
         // Selecting the applet is the host saying it is interested in this
         // card right now, and at the lock screen that happens when the screen
-        // wakes — which is when the user is walking up to it. So the board
-        // starts watching its own ring, briefly, and a touch given before
-        // macOS asks for a signature still counts.
+        // wakes — which is when the user is walking up to it. So a board
+        // with no usable wake line may poll its ring, briefly. Whether a
+        // touch then counts is not decided here: see idleRingListens.
         //
         // Briefly is the whole safety argument. Watching costs an image
         // capture per poll on a board whose wake line cannot be trusted, and
@@ -820,6 +820,54 @@ TransceiveStatus PivApplet::transceive(const uint8_t *command,
         return TransceiveStatus::complete;
     }
 
+    // APPROVE. The one instruction nothing pays for in advance: a VERIFY
+    // that a touch answered, the agreement that touch bought and a touch the
+    // idle ring took are all for logging in, and this path reads none of
+    // them. The gate behind it counts only a finger that landed after the
+    // question (demandsFreshTouch), and what it buys is this one signature.
+    //
+    // The card builds and hashes the message itself. GENERAL AUTHENTICATE
+    // signs any digest a host hands it with the same key, so the signature
+    // proves a touch only to a verifier that drew the number at random and
+    // showed it to nobody else.
+    if (apdu.instruction == kApproveInstruction) {
+        if (apdu.cla != 0x80 || apdu.parameter1 != kApprovalAdministrator ||
+            apdu.parameter2 != 0x00) {
+            status(0x6A86, response, responseCapacity, responseLength);
+            return TransceiveStatus::complete;
+        }
+        if (apdu.data.size != kApprovalNumberSize) {
+            status(0x6700, response, responseCapacity, responseLength);
+            return TransceiveStatus::complete;
+        }
+        // Before the gate, as for a signature: no key, nothing to wait for.
+        if (!provisioned()) {
+            status(0x6A88, response, responseCapacity, responseLength);
+            return TransceiveStatus::complete;
+        }
+        if (!userPresent) {
+            return TransceiveStatus::userPresenceRequired;
+        }
+
+        // The label goes in with its terminating zero.
+        uint8_t message[sizeof(kApprovalLabel) + 1 + kApprovalNumberSize];
+        std::memcpy(message, kApprovalLabel, sizeof(kApprovalLabel));
+        message[sizeof(kApprovalLabel)] = apdu.parameter1;
+        std::memcpy(message + sizeof(kApprovalLabel) + 1, apdu.data.data,
+                    kApprovalNumberSize);
+        uint8_t signature[80];
+        size_t signatureLength = 0;
+        if (!credential_.signMessageP256Sha256({message, sizeof(message)},
+                                               signature, sizeof(signature),
+                                               signatureLength) ||
+            signatureLength == 0 || signatureLength > sizeof(signature)) {
+            status(0x6F00, response, responseCapacity, responseLength);
+            return TransceiveStatus::complete;
+        }
+        sendData(signature, signatureLength, apdu.expectedLength);
+        return TransceiveStatus::complete;
+    }
+
     if (apdu.instruction == 0xE1) {
         if (apdu.cla != 0x80 || apdu.parameter1 != 0x00 ||
             apdu.parameter2 != 0x00) {
@@ -989,6 +1037,20 @@ bool AttemptLedger::charge(uint64_t nowMilliseconds) {
 void AttemptLedger::matched() {
     limiter_.recordSuccess();
     store_.save(limiter_.consecutiveFailures(), limiter_.lockoutCount());
+}
+
+FreshTouch::FreshTouch(uint8_t emptyReadings)
+    : emptyReadings_(emptyReadings) {}
+
+bool FreshTouch::observe(bool fingerPresent) {
+    if (fingerPresent) {
+        emptyRun_ = 0;
+        return seenEmpty_;
+    }
+    if (!seenEmpty_ && ++emptyRun_ >= emptyReadings_) {
+        seenEmpty_ = true;
+    }
+    return false;
 }
 
 EarlyTouch::EarlyTouch(uint64_t validMilliseconds)
