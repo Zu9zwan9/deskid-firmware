@@ -52,7 +52,7 @@ constexpr uint8_t kArmingInstance = 1;
 constexpr uint8_t kArmingEndpoint = 0x83;
 constexpr uint8_t kArmAutotypeCommand = 0x01;
 // The same request for a display that is asleep: a match taps the wake key
-// and the digits wait for the next ordinary arming. See deskid::Autotype.
+// and Return waits for the next ordinary arming. See deskid::Autotype.
 constexpr uint8_t kArmToWakeCommand = 0x02;
 // Leave the bus and come back. See leaveAndRejoinBus().
 constexpr uint8_t kReinsertCommand = 0x03;

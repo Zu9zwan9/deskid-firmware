@@ -1463,33 +1463,24 @@ void test_autotype_wake_tap_is_left_shift_alone() {
     }
 }
 
-void test_autotype_presses_and_releases_keypad_digits_then_return() {
-    uint32_t digits = 0;
-    for (size_t index = 0; index < deskid::Autotype::kReportCount; ++index) {
-        uint8_t report[8];
-        std::memset(report, 0xAA, sizeof(report));
-        deskid::Autotype::report(index, report);
-        // No modifiers and never two keys at once.
-        TEST_ASSERT_EQUAL_UINT8(0, report[0]);
-        TEST_ASSERT_EQUAL_UINT8(0, report[1]);
-        for (size_t slot = 3; slot < sizeof(report); ++slot) {
-            TEST_ASSERT_EQUAL_UINT8(0, report[slot]);
-        }
-        if (index % 2 == 1) {
-            // Every press is followed by a release, the last report included:
-            // a key left down repeats until something else is typed.
-            TEST_ASSERT_EQUAL_UINT8(0, report[2]);
-        } else if (index + 2 == deskid::Autotype::kReportCount) {
-            TEST_ASSERT_EQUAL_UINT8(0x28, report[2]);  // Return
-        } else {
-            // Keypad 1 to Keypad 0: digits under every keyboard layout.
-            TEST_ASSERT_TRUE(report[2] >= 0x59 && report[2] <= 0x62);
-            ++digits;
-        }
-    }
-    // VERIFY carries a PIN of six to eight digits.
-    TEST_ASSERT_EQUAL_UINT32(6, digits);
-    TEST_ASSERT_EQUAL_UINT32(0, deskid::Autotype::kReportCount % 2);
+void test_autotype_presses_return_and_types_nothing_else() {
+    // One key: its press and its release.
+    TEST_ASSERT_EQUAL_UINT32(2, deskid::Autotype::kReportCount);
+
+    uint8_t report[8];
+    std::memset(report, 0xAA, sizeof(report));
+    deskid::Autotype::report(0, report);
+    // Return alone: no modifier, no digit. A digit would draw a dot in the
+    // PIN field, and the field is submitted empty.
+    const uint8_t pressed[8] = {0, 0, 0x28, 0, 0, 0, 0, 0};
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(pressed, report, sizeof(report));
+
+    // The press is followed by a release: a key left down repeats until
+    // something else is typed.
+    std::memset(report, 0xAA, sizeof(report));
+    deskid::Autotype::report(1, report);
+    const uint8_t released[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(released, report, sizeof(report));
 }
 
 void test_wake_line_is_believed_after_both_levels_and_reads_its_touched_level() {
@@ -1739,7 +1730,7 @@ int main(int, char **) {
     RUN_TEST(test_autotype_forgets_a_woken_match_nobody_claimed);
     RUN_TEST(test_autotype_types_for_a_match_that_woke_a_sleeping_host);
     RUN_TEST(test_autotype_wake_tap_is_left_shift_alone);
-    RUN_TEST(test_autotype_presses_and_releases_keypad_digits_then_return);
+    RUN_TEST(test_autotype_presses_return_and_types_nothing_else);
     RUN_TEST(test_wake_line_is_believed_after_both_levels_and_reads_its_touched_level);
     RUN_TEST(test_an_approval_waits_for_a_touch_and_signs_the_labelled_request);
     RUN_TEST(test_an_approval_is_never_paid_for_in_advance);

@@ -1171,15 +1171,12 @@ void Autotype::wakeReport(bool pressed, uint8_t report[8]) {
 }
 
 void Autotype::report(size_t index, uint8_t report[8]) {
-    // Keypad 1 to Keypad 6, then Return. HID sends key positions, and the top
-    // row is not digits under every layout (AZERTY wants Shift); the keypad
-    // is. Six digits because that is the shortest PIN a PIV VERIFY carries.
-    static constexpr uint8_t kKeys[] = {0x59, 0x5A, 0x5B, 0x5C,
-                                        0x5D, 0x5E, 0x28};
-    static_assert(kReportCount == 2 * sizeof(kKeys));
+    // Return, the same key position under every layout. No digits: each one
+    // draws a dot in the PIN field, and macOS takes the field empty.
+    static_assert(kReportCount == 2);
     std::memset(report, 0, 8);
-    if (index % 2 == 0 && index / 2 < sizeof(kKeys)) {
-        report[2] = kKeys[index / 2];
+    if (index == 0) {
+        report[2] = 0x28;
     }
 }
 
