@@ -126,12 +126,12 @@ constexpr uint32_t kArmedScanMilliseconds = 250;
 // How long each keyboard report stands before the next: a press and a release
 // per key, so a key takes twice this. A static password typed faster than
 // about 40 ms a key loses characters at the macOS login window (reports from
-// YubiKey users); tune it here if a board ever drops a digit.
+// YubiKey users); tune it here if a board ever drops its Return.
 constexpr uint32_t kAutotypeReportMilliseconds = 30;
-// How long the digits wait once the host says a woken lock screen is lit.
+// How long Return waits once the host says a woken lock screen is lit.
 // The host goes by the display state, which leads the PIN field, and macOS
 // drops the first keys after a display wake (user reports on 15.2 and
-// 15.3.1). Tune it here if a board ever loses a digit after a wake.
+// 15.3.1). Tune it here if a board ever loses its Return after a wake.
 constexpr uint32_t kAutotypeLitMilliseconds = 400;
 // How long the board stays off the bus when a host asks it to reinsert
 // itself. Long enough for the host to see the reader go; a hand takes longer.
@@ -1592,15 +1592,15 @@ uint8_t g_lastGateInstruction = 0;
 // A match that happened before any host asked for one. Reported through status
 // tags 0x11 and 0x12; the policy it enforces is tested in test/test_piv.
 deskid::EarlyTouch g_earlyTouch(kEarlyTouchValidMilliseconds);
-// Whether a host has asked for the PIN digits to be typed after the next
+// Whether a host has asked for the PIN field to be submitted after the next
 // match. The policy is deskid::Autotype and is tested in test/test_piv.
 deskid::Autotype g_autotype;
 
-// Types the digits and Return. Blocking on purpose: whatever the host sends
-// meanwhile, a press is followed by its release, because a key left down
-// repeats until something else is typed. Unused in the sensorless bring-up
-// build, where no touch ever matches.
-[[maybe_unused]] void typeDummyPin() {
+// Presses Return, which submits the PIN field empty. Blocking on purpose:
+// whatever the host sends meanwhile, the press is followed by its release,
+// because a key left down repeats until something else is typed. Unused in
+// the sensorless bring-up build, where no touch ever matches.
+[[maybe_unused]] void submitPinField() {
     uint8_t report[8];
     for (size_t index = 0; index < deskid::Autotype::kReportCount; ++index) {
         deskid::Autotype::report(index, report);
@@ -1800,7 +1800,7 @@ private:
 // there and then and the result held for kEarlyTouchValidMilliseconds. That
 // is what removes the dead time the product is actually judged by: macOS
 // draws its own PIN field before it ever reaches the card, and without this
-// the sensor stays dark until those digits have been typed.
+// the sensor stays dark until that field has been submitted.
 //
 // At most one capture per call, so a request arriving mid-match waits for one
 // match and not for a loop.
@@ -1905,10 +1905,10 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
             if (g_autotype.take(millisecondsSinceBoot())) {
                 g_earlyTouch.record(millisecondsSinceBoot());
                 if (g_autotype.wakes()) {
-                    // The digits follow when the host says the screen is lit.
+                    // Return follows when the host says the screen is lit.
                     wakeMac();
                 } else {
-                    typeDummyPin();
+                    submitPinField();
                 }
             } else if (deskid::hostAsleep()) {
                 // No helper runs on a Mac that is asleep, so nothing armed
@@ -1971,7 +1971,7 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
 #else
     g_lastGateInstruction = request.apduLength > 1 ? request.apdu[1] : 0;
     // Only a submitted PIN field makes macOS ask for a login instruction, so
-    // digits typed for a match that woke the Mac have landed. Any process can
+    // Return pressed for a match that woke the Mac has landed. Any process can
     // send the other gated instructions, and they say nothing about a field.
     if (deskid::EarlyTouch::maySpend(g_lastGateInstruction)) {
         g_autotype.hostActed();
@@ -2215,7 +2215,7 @@ extern "C" void app_main() {
                     // A match woke the display, and the host now says the
                     // lock screen is lit and still locked.
                     vTaskDelay(pdMS_TO_TICKS(kAutotypeLitMilliseconds));
-                    typeDummyPin();
+                    submitPinField();
                 }
                 // An armed board has to be watching its ring, wake line or
                 // not.
@@ -2224,8 +2224,8 @@ extern "C" void app_main() {
                     nowMs + g_autotype.secondsRemaining(nowMs) * 1000ULL);
             }
             if (g_autotype.retype(millisecondsSinceBoot())) {
-                // The first digits met a display that was still coming up.
-                typeDummyPin();
+                // The first Return met a display that was still coming up.
+                submitPinField();
             }
             if (deskid::takeReinsertRequest()) {
                 // The host has registered a new driver for the card. Whatever
