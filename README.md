@@ -276,8 +276,9 @@ Measured on 2026-11-13 on a `deskid` board with an R503 and macOS 27.0.1, one ru
 - A finger held on the ring for the whole 30 s: refused with `6982`, and the status object showed no failed match.
 - A touch with nothing armed and the Mac awake: the ring stayed dark.
 - The lock screen, with the helper arming the board: one touch unlocked the Mac, as it did before.
+- The lock screen with the display asleep, same helper: a touch unlocked the Mac.
 
-Not measured: the match time by itself, the look on a sensor without a green LED, and a dark display or a sleeping Mac on this firmware.
+Not measured: the match time by itself, the look on a sensor without a green LED, and a sleeping Mac on this firmware.
 
 ### Touch only
 
