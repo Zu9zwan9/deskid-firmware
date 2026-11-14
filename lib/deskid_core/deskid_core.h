@@ -305,8 +305,8 @@ private:
 // Touch ID is live before the prompt appears; the prompt is what happens
 // afterwards. DeskID needs the same shape because macOS draws its own PIN
 // field for every smart card and no public setting removes it: without a
-// window like this the sensor stays dark until that field has been submitted,
-// and the user waits twice. With it the touch can happen on
+// window like this the sensor stays dark until those meaningless digits have
+// been typed, and the user waits twice. With it the touch can happen on
 // arrival and the login instruction is answered with no wait at all.
 //
 // The window is the whole security trade — long enough to cover walking from
@@ -364,26 +364,21 @@ private:
 /// has lapsed before another window takes the keyboard.
 constexpr uint8_t kMaximumAutotypeSeconds = 15;
 
-// The PIN field macOS draws, submitted by the board.
+// The digits macOS asks for, typed by the board.
 //
 // macOS draws a PIN field for every smart card and the applet ignores what is
-// typed into it: the fingerprint is the check. DeskID's token driver asks for
-// no PIN, so macOS takes the field empty. After a match the board presses
-// Return itself over USB HID, and a login is one touch with nothing drawn in
-// the field. Return unlocks nothing. The signature that follows still has to
-// spend the fingerprint match, as it does when a person presses the key.
-//
-// Until 2026-11-13 the board typed six keypad digits first. They drew six
-// dots for 0.4 s and bought nothing (measured that day, macOS 27.0.1: the
-// lock screen unlocks from an empty field).
+// typed into it: the fingerprint is the check. So after a match the board can
+// type the digits and Return itself over USB HID, and a login is one touch.
+// What it types is a constant and unlocks nothing. The signature that follows
+// still has to spend the fingerprint match, as it does when a person types.
 //
 // The board cannot see the screen. The host says when a PIN field has the
 // keyboard, and that permission is short and single use, because keystrokes
 // sent at any other moment land in whatever window is in front.
 class Autotype {
 public:
-    /// Reports in one emission: the press of Return and its release.
-    static constexpr size_t kReportCount = 2;
+    /// Reports in one emission: a press and a release for each key.
+    static constexpr size_t kReportCount = 14;
 
     /// Zero seconds disarms, and forgets a match that is waiting for a lit
     /// screen.
@@ -393,7 +388,7 @@ public:
     /// wake key and waits. The host's next ordinary arming says the lock
     /// screen is lit and still locked, and this returns true: the caller
     /// types. The board never guesses how long a display takes to wake, and
-    /// a Mac that something else unlocked meanwhile gets no key.
+    /// a Mac that something else unlocked meanwhile gets no digits.
     bool arm(uint8_t seconds, uint64_t nowMilliseconds, bool toWake = false);
     uint8_t secondsRemaining(uint64_t nowMilliseconds) const;
     /// True once per arming, inside its window. The caller then types, or
@@ -402,16 +397,16 @@ public:
     /// Whether the arming last taken was to wake.
     bool wakes() const;
     /// A match that woke a sleeping host. Nothing can be in front of a Mac
-    /// that is asleep, so this needs no arming. Return still waits for the
-    /// host to say its lock screen is lit.
+    /// that is asleep, so this needs no arming. The digits still wait for
+    /// the host to say its lock screen is lit.
     void wokeHost(uint64_t nowMilliseconds);
-    /// True when Return pressed for a match that woke the Mac got no answer
-    /// and is due again. macOS drops keys for a couple of seconds while a
-    /// display comes up, and says nothing. What proves it landed is the
+    /// True when digits typed for a match that woke the Mac got no answer and
+    /// are due again. macOS drops keys for a couple of seconds while a
+    /// display comes up, and says nothing. What proves they landed is the
     /// host asking the card for a private-key operation: see hostActed().
     bool retype(uint64_t nowMilliseconds);
-    /// The host asked the card for something only a login asks for, so
-    /// Return landed and nothing more is typed.
+    /// The host asked the card for something only a login asks for, so the
+    /// digits landed and nothing more is typed.
     void hostActed();
     uint32_t emissions() const;
 
@@ -433,14 +428,13 @@ private:
     bool toWake_ = false;
 };
 
-/// How long Return pressed for a woken match waits for the host to act
-/// before it is pressed again, counted from the host's word. The wait for a
-/// lit screen and the key take 0.5 s of it. A display with an external
-/// monitor took 2.0 s from the wake tap to taking keys (measured 2026-11-13,
-/// macOS 27.0.1).
+/// How long digits typed for a woken match wait for the host to act before
+/// they are typed again, counted from the host's word. Typing takes 0.8 s of
+/// it. A display with an external monitor took 2.0 s from the wake tap to
+/// taking keys (measured 2026-11-13, macOS 27.0.1).
 constexpr uint32_t kRetypeMilliseconds = 2200;
-/// Pressed again at most this often. If the Mac is not paired with the card,
-/// each one submits its password field empty.
+/// Typed again at most this often. If the Mac is not paired with the card,
+/// the digits are a wrong password each time.
 constexpr uint8_t kMaximumRetypes = 2;
 
 /// How long a match that woke the Mac waits for the host to say the lock

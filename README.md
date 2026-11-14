@@ -21,7 +21,7 @@ The clip shows a locked Mac unlocking on one touch, in real time, on the first h
 - Host-driven authentication. macOS sends an APDU, CCID reports time extensions while the R503 waits, and a matching fingerprint releases the signature. The device sends no unsolicited APDU.
 - Touch first. While a host has armed the board, or sleeps, the sensor is scanned between requests. A match is held for 30 s and can be spent once, by `VERIFY` or `GENERAL AUTHENTICATE`. See [Touch first](#touch-first).
 - Approval. `80 E4` asks the person at the ring to let a program act as administrator, and answers with a signature over a labelled request. Only a touch that begins after the request counts. See [Approval](#approval).
-- Touch only, on development builds. A host arms the board, and after the next match the board presses Return itself over USB HID, and macOS takes the PIN field empty. See [Touch only](#touch-only).
+- Touch only, on development builds. A host arms the board, and after the next match the board types the PIN digits and Return itself over USB HID. See [Touch only](#touch-only).
 - A P-256 key and a matching X.509 certificate in NVS. The identity comes from a host image or is generated on the device (`GENERATE ASYMMETRIC KEY PAIR` `0x47` and `PUT DATA` `0xDB`).
 - ECDSA with a hedged nonce. See [Signature nonce](#signature-nonce).
 - A diagnostic channel over PC/SC, because this board has no serial console: a status object at `GET DATA 5FFF01`, and `80 F0 00 00 00` to reboot into ROM download mode without a BOOT press. On this board `80 F0` lands in USB-OTG DFU. See [Entering download mode](#entering-download-mode).
@@ -257,7 +257,7 @@ The firmware scans the sensor between host requests while someone has asked for 
 
 1. A host arms the board ([Touch only](#touch-only)), or the Mac is asleep.
 2. Touch the sensor. The ring turns solid blue on contact, matches in about 0.8 s and shows green.
-3. Return follows, pressed by the board or by hand. The PIN field stays empty.
+3. The digits and Return follow, typed by the board or by hand.
 4. The card answers without waiting. Status tag `0x0E` reports that an earlier touch answered, and `0x11` counts those answers.
 
 With no arming and a Mac that is awake, the ring is dark and a touch is not read. Earlier firmware matched any idle touch and held it for the first process that asked the card, whoever that was. `deskid::idleRingListens` is the rule and `test/test_piv` tests it. The limit: arming is unauthenticated on development builds, so local software can still arm the board and wait for a touch. A production build takes no arming, so there a touch counts only at the gate and on a sleeping Mac.
@@ -305,15 +305,12 @@ Measured on 2026-11-13 on a `deskid` board with an R503 and macOS 27.0.1, one ru
 - A finger held on the ring for the whole 30 s: refused with `6982`, and the status object showed no failed match.
 - A touch with nothing armed and the Mac awake: the ring stayed dark.
 - The lock screen, with the helper arming the board: one touch unlocked the Mac, as it did before.
-- The lock screen with the display asleep, same helper: a touch unlocked the Mac.
 
-Not measured: the match time by itself, the look on a sensor without a green LED, and a sleeping Mac on this firmware.
+Not measured: the match time by itself, the look on a sensor without a green LED, and a dark display or a sleeping Mac on this firmware.
 
 ### Touch only
 
-A development build can submit the PIN field for you. macOS still draws the field. DeskID's token driver asks for no PIN, so macOS takes the field empty: after a fingerprint match the board presses Return over USB HID, and the login instruction that follows spends that same match. No dot appears in the field. Return unlocks nothing. The applet ignores the PIN value and signs only after a match.
-
-Earlier firmware typed six keypad digits before Return. They drew six dots for about 0.4 s and the card ignored them.
+A development build can type the PIN for you. macOS still draws its PIN field, and the board fills it: after a fingerprint match it types six keypad digits and Return over USB HID, and the login instruction that follows spends that same match. The digits are a constant and unlock nothing. The applet ignores the PIN value and signs only after a match.
 
 The board presents three USB interfaces: the CCID reader, a keyboard, and a vendor HID interface for arming. It cannot see the screen, so a host tells it when a PIN field has the keyboard:
 
@@ -330,22 +327,23 @@ Four rules bound it:
 - Armed only. A match types nothing unless a host armed the board in the last 15 s (`kMaximumAutotypeSeconds`).
 - Single use. One arming types once, and zero seconds disarms.
 - A match is still required, from a touch that lands while the board is armed. A touch given earlier is never typed for, so one left behind cannot unlock a screen that locked after it.
-- Development builds only. `DESKID_ALLOW_AUTOTYPE` is set for `env:deskid`. Arming carries no authentication yet, so any local process can ask the board to press Return after your next touch, into whatever window is in front. A production image ignores the request.
+- Development builds only. `DESKID_ALLOW_AUTOTYPE` is set for `env:deskid`. Arming carries no authentication yet, so any local process can ask the board to type its constant after your next touch. A production image ignores the request.
 
-Return is down for 30 ms and up for 30 ms (`kAutotypeReportMilliseconds`). `deskid::Autotype` holds the policy and `test/test_piv` tests it.
+Each key is down for 30 ms and up for 30 ms (`kAutotypeReportMilliseconds`), about 0.4 s for the seven keys. `deskid::Autotype` holds the policy and `test/test_piv` tests it.
 
-Keys sent into a dark lock screen are lost. Armed with `02`, a match taps Left Shift and types nothing. The display wakes, the host sees a lit screen that is still locked and arms with `01`, and that arming presses Return 400 ms later (`kAutotypeLitMilliseconds`). The match waits 10 s for it (`kWokenMatchMilliseconds`). Zero seconds drops the match, so a Mac that something else unlocked in between gets no key.
+Keys sent into a dark lock screen are lost. Armed with `02`, a match taps Left Shift and types nothing. The display wakes, the host sees a lit screen that is still locked and arms with `01`, and that arming types the digits 400 ms later (`kAutotypeLitMilliseconds`). The match waits 10 s for it (`kWokenMatchMilliseconds`). Zero seconds drops the match, so a Mac that something else unlocked in between gets no digits.
 
-macOS drops keys while a display comes up and reports nothing. Measured on 2026-11-13 on macOS 27.0.1 with an external monitor: the wake tap lit the display, digits typed 0.6 s to 1.0 s after it were lost, and the display took keys 2.0 s after the tap. So Return is pressed again every 2.2 s (`kRetypeMilliseconds`), at most twice (`kMaximumRetypes`), until the host asks the card for a private-key operation, which only a submitted PIN field causes.
+macOS drops keys while a display comes up and reports nothing. Measured on 2026-11-13 on macOS 27.0.1 with an external monitor: the wake tap lit the display, digits typed 0.6 s to 1.0 s after it were lost, and the display took keys 2.0 s after the tap. So the digits are typed again every 2.2 s (`kRetypeMilliseconds`), at most twice (`kMaximumRetypes`), until the host asks the card for a private-key operation, which only a submitted PIN field causes.
 
 A Mac that is fully asleep suspends the bus and runs no helper, so nothing arms the board. A match then signals remote wakeup, taps Left Shift once the bus resumes, and is held for the `01` arming the same way. The configuration descriptor sets the remote wakeup bit for this. A board whose wake line is not trusted does not watch its ring while the Mac sleeps and cannot wake it.
 
 What to expect from macOS:
 
 - Keyboard Setup Assistant can open the first time macOS meets a keyboard it does not recognise. Close it if it does.
+- With Mouse Keys on, the keypad moves the pointer and no digits arrive.
 - A locked Apple silicon laptop can hold back a keyboard it has not approved. The setting is "Allow accessories to connect" in Privacy & Security.
 
-Measured on 2026-11-13 on macOS 27.0.1, on a `deskid` board with an R503, on the firmware that typed six digits before Return:
+Measured on 2026-11-13 on macOS 27.0.1, on a `deskid` board with an R503:
 
 - Armed, with a text editor in front: one touch typed `123456` and Return, 955 ms after contact.
 - Armed, with an administrator prompt in front: one touch authorized it. The prompt closed within 3 s of contact and the status object reported `answered by an earlier touch`.
@@ -354,9 +352,7 @@ Measured on 2026-11-13 on macOS 27.0.1, on a `deskid` board with an R503, on the
 
 - At the lock screen, with the card paired and a host process arming the board while the screen was locked and lit: one touch unlocked the Mac. The signature took 220 ms and the key agreement that followed took 201 ms.
 
-Measured the same day by hand, one run: at the lock screen, Return in an empty PIN field and then a touch unlocked the Mac. That is the sequence the board now sends.
-
-Not run yet on this firmware: the board pressing Return at the lock screen, at an administrator prompt and after a display wake. Not run on any firmware: `sudo`, an unenrolled finger while armed, and waking a Mac that is asleep. This repository has no helper that arms the board on its own, so `tools/deskid_arm.swift` is the trigger.
+Not run yet: `sudo`, an unenrolled finger while armed, the `02` request on a sleeping display, and waking a Mac that is asleep. This repository has no helper that arms the board on its own, so `tools/deskid_arm.swift` is the trigger.
 
 ### Guided setup
 
@@ -371,7 +367,7 @@ The app guards against four mistakes:
 - Missing the touch during pairing. `sc_auth pair` makes the card prove it holds the private key, which needs a fingerprint match inside the 30 s window. Without one `sc_auth` reports `6982` and does not mention a finger. The app says so before you click and shows the ring waiting.
 - Pairing a `deskid-bringup` image, which approves each presence request with no sensor attached. The app reads the build variant and refuses.
 - Signing in before the sensor can match. The app offers the signature test and pairing only after a template is enrolled.
-- Getting locked out. The last screen lists the daily steps: Return at the PIN field, touch, and unplug to get password login back. Unpair is on the pairing screen while the card is paired and needs no admin password.
+- Getting locked out. The last screen lists the daily steps: any 6 to 8 digits at the PIN field, touch, and unplug to get password login back. Unpair is on the pairing screen while the card is paired and needs no admin password.
 
 The launcher compiles `tools/deskid_setup.swift` into `dist/DeskID Setup.app` on first run, in about half a minute, and ad-hoc signs it with the `com.apple.security.smartcard` entitlement. CryptoTokenKit gives a process without that entitlement no slots, so the app is a bundle. It needs no Xcode project and no developer account. `tools/deskid-setup --build` builds without launching. The app runs on macOS 14 or later and can be copied to another Mac.
 

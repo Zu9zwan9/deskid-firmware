@@ -23,7 +23,7 @@ DeskID targets these surfaces and already is a smart card.
 
 | Where | Touch ID | DeskID today | To close the gap |
 |---|---|---|---|
-| Lock Screen | Touch | Works. macOS draws a PIN field and takes it empty: Return, then the ring. Once a host has armed the board, one touch does both and the card answers in 0.2 s | Nothing removes Apple's field |
+| Lock Screen | Touch | Works. macOS draws a PIN field; any digits, then the ring. Touch first makes it 0.2 s once a host has armed the board | Nothing removes Apple's field |
 | Login after restart | Password first, by design | Card logs in; the disk and keychain still want the password | Gap A, slot 9D |
 | System dialogs (Settings padlock, installers) | Touch | Supported for a paired card, with the PIN field | Bench: confirm on 27.0.1 with the DeskID driver |
 | `sudo` | `pam_tid` | `pam_smartcard`, PIN field in Terminal | Gap B, `pam_deskid` |

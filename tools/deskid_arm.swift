@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Strict-1.0.0
 // Source-available under LICENSE.md with the permissions in LICENSING.md.
 
-// Arms a DeskID board to press Return after the next fingerprint match.
+// Arms a DeskID board to type the PIN digits after the next fingerprint match.
 //
 //     swift tools/deskid_arm.swift        # 10 seconds
 //     swift tools/deskid_arm.swift 15     # the board caps this at 15
 //     swift tools/deskid_arm.swift 0      # disarm
 //
-// The board presses Return in whatever has the keyboard, which submits a
-// PIN field empty. Put the cursor somewhere that is harmless, run this, then touch
+// The board types six keypad digits and Return into whatever has the
+// keyboard. Put the cursor somewhere that is harmless, run this, then touch
 // the ring. See "Touch only" in the README.
 
 import Foundation
