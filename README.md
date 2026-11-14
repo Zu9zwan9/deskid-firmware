@@ -260,13 +260,24 @@ The ring breathes cyan, which no login does. After a match the card returns an E
 Four rules:
 
 - Nothing pays for it in advance. A `VERIFY` answered by a touch, the key agreement that touch bought and a match held from the idle ring are for logging in. This instruction reads none of them.
-- The touch has to begin after the request. A finger already on the ring is ignored until the ring has read empty three times in a row (`kFreshTouchEmptyReadings`), about 60 ms. `deskid::FreshTouch` holds the rule.
+- The touch has to begin after the request. A finger already on the ring is ignored until the ring has read empty three times in a row (`kFreshTouchEmptyReadings`), which takes 60 ms plus the three readings. `deskid::FreshTouch` holds the rule.
 - It buys one signature. The next login signature, key agreement or approval asks for its own touch.
 - The card builds and hashes the message. `GENERAL AUTHENTICATE` signs any digest a host hands it with the same key, so the signature proves a touch only to a verifier that drew the number at random and showed it to nobody else. A PAM module inside `sudo` is such a verifier. A value the asker reuses or publishes proves nothing.
 
 The board does not know which program asked. Showing that is the host's job.
 
-`test/test_piv` covers the instruction, the message and the three policy rules. Not run on a board yet: the cyan look, and a resting finger at the gate.
+`test/test_piv` covers the instruction, the message and the policy rules.
+
+Measured on 2026-11-13 on a `deskid` board with an R503 and macOS 27.0.1, one run each, with `deskidctl approve` from the macOS repository as the asker:
+
+- The firmware before this instruction answered `6D00`.
+- A touch after the request: the signature verified against the board's certificate 12.3 s after the request. The time includes the person reading what to do.
+- A finger on the ring before the request, then lifted and placed again: verified after 8.8 s.
+- A finger held on the ring for the whole 30 s: refused with `6982`, and the status object showed no failed match.
+- A touch with nothing armed and the Mac awake: the ring stayed dark.
+- The lock screen, with the helper arming the board: one touch unlocked the Mac, as it did before.
+
+Not measured: the match time by itself, the look on a sensor without a green LED, and a dark display or a sleeping Mac on this firmware.
 
 ### Touch only
 
