@@ -1328,6 +1328,120 @@ void test_autotype_fires_once_per_arming_and_only_inside_the_window() {
     TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
 }
 
+void test_autotype_to_wake_taps_first_and_types_when_the_host_says_lit() {
+    deskid::Autotype autotype;
+    autotype.arm(10, 1000, true);
+    TEST_ASSERT_TRUE(autotype.take(2000));
+    // The caller taps the wake key. No digits yet, so no emission yet.
+    TEST_ASSERT_TRUE(autotype.wakes());
+    TEST_ASSERT_EQUAL_UINT32(0, autotype.emissions());
+
+    // The display is still dark and the host renews: the match keeps waiting.
+    TEST_ASSERT_FALSE(autotype.arm(10, 2500, true));
+    // The host sees the lock screen lit: this arming is the word to type,
+    // and it is spent on that.
+    TEST_ASSERT_TRUE(autotype.arm(10, 3000));
+    TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
+    TEST_ASSERT_FALSE(autotype.take(3500));
+    // The word is given once. A second arming types nothing more.
+    TEST_ASSERT_FALSE(autotype.arm(10, 3600));
+    TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
+}
+
+void test_autotype_types_again_until_the_host_acts() {
+    deskid::Autotype autotype;
+    autotype.arm(10, 1000, true);
+    TEST_ASSERT_TRUE(autotype.take(2000));
+    // Nothing is typed again before the host's word.
+    TEST_ASSERT_FALSE(autotype.retype(2000 + deskid::kRetypeMilliseconds));
+    TEST_ASSERT_TRUE(autotype.arm(10, 3000));
+
+    // The display was still coming up and macOS dropped the digits.
+    TEST_ASSERT_FALSE(autotype.retype(3000 + deskid::kRetypeMilliseconds - 1));
+    TEST_ASSERT_TRUE(autotype.retype(3000 + deskid::kRetypeMilliseconds));
+    TEST_ASSERT_EQUAL_UINT32(2, autotype.emissions());
+    // These landed: macOS asked the card to sign. Nothing more is typed.
+    autotype.hostActed();
+    TEST_ASSERT_FALSE(autotype.retype(60000));
+    TEST_ASSERT_EQUAL_UINT32(2, autotype.emissions());
+}
+
+void test_autotype_stops_typing_into_a_mac_that_never_answers() {
+    deskid::Autotype autotype;
+    autotype.wokeHost(1000);
+    TEST_ASSERT_TRUE(autotype.arm(10, 2000));
+    uint64_t now = 2000;
+    uint32_t retypes = 0;
+    for (int tick = 0; tick < 200; ++tick) {
+        now += 100;
+        if (autotype.retype(now)) {
+            ++retypes;
+        }
+    }
+    // An unpaired Mac takes the digits as a wrong password, so this is
+    // bounded, and it ends with the woken match at the latest.
+    TEST_ASSERT_TRUE(retypes <= deskid::kMaximumRetypes);
+    TEST_ASSERT_EQUAL_UINT32(1 + retypes, autotype.emissions());
+
+    // A host that disarms stops it at once.
+    autotype.wokeHost(50000);
+    TEST_ASSERT_TRUE(autotype.arm(10, 51000));
+    autotype.arm(0, 51500);
+    TEST_ASSERT_FALSE(autotype.retype(51000 + deskid::kRetypeMilliseconds));
+}
+
+void test_autotype_forgets_a_woken_match_nobody_claimed() {
+    deskid::Autotype autotype;
+    // Something else unlocked the Mac after the wake tap: the host disarms.
+    autotype.arm(10, 1000, true);
+    TEST_ASSERT_TRUE(autotype.take(2000));
+    autotype.arm(0, 2500);
+    TEST_ASSERT_FALSE(autotype.arm(10, 3000));
+    TEST_ASSERT_TRUE(autotype.take(3500));
+    TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
+
+    // The host said nothing in time: the touch is not typed for.
+    autotype.arm(10, 10000, true);
+    TEST_ASSERT_TRUE(autotype.take(11000));
+    TEST_ASSERT_FALSE(
+        autotype.arm(10, 11000 + deskid::kWokenMatchMilliseconds));
+    TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
+}
+
+void test_autotype_types_for_a_match_that_woke_a_sleeping_host() {
+    deskid::Autotype autotype;
+    // Nobody armed the board: the host was asleep. The match woke it.
+    autotype.wokeHost(1000);
+    TEST_ASSERT_EQUAL_UINT32(0, autotype.emissions());
+    // The host is up, sees a lit lock screen and arms: that is the word.
+    TEST_ASSERT_TRUE(autotype.arm(10, 4000));
+    TEST_ASSERT_EQUAL_UINT32(1, autotype.emissions());
+
+    // A Mac that woke unlocked never arms, and the match lapses.
+    autotype.wokeHost(20000);
+    TEST_ASSERT_FALSE(
+        autotype.arm(10, 20000 + deskid::kWokenMatchMilliseconds));
+    // One that disarms drops it at once.
+    autotype.wokeHost(40000);
+    autotype.arm(0, 41000);
+    TEST_ASSERT_FALSE(autotype.arm(10, 42000));
+}
+
+void test_autotype_wake_tap_is_left_shift_alone() {
+    uint8_t report[8];
+    std::memset(report, 0xAA, sizeof(report));
+    deskid::Autotype::wakeReport(true, report);
+    TEST_ASSERT_EQUAL_UINT8(0x02, report[0]);
+    for (size_t slot = 1; slot < sizeof(report); ++slot) {
+        TEST_ASSERT_EQUAL_UINT8(0, report[slot]);
+    }
+    std::memset(report, 0xAA, sizeof(report));
+    deskid::Autotype::wakeReport(false, report);
+    for (size_t slot = 0; slot < sizeof(report); ++slot) {
+        TEST_ASSERT_EQUAL_UINT8(0, report[slot]);
+    }
+}
+
 void test_autotype_presses_and_releases_keypad_digits_then_return() {
     uint32_t digits = 0;
     for (size_t index = 0; index < deskid::Autotype::kReportCount; ++index) {
@@ -1428,6 +1542,12 @@ int main(int, char **) {
     RUN_TEST(test_hedged_nonce_seed_reduces_a_digest_at_or_above_the_group_order);
     RUN_TEST(test_status_object_reports_a_failed_signing_self_test);
     RUN_TEST(test_autotype_fires_once_per_arming_and_only_inside_the_window);
+    RUN_TEST(test_autotype_to_wake_taps_first_and_types_when_the_host_says_lit);
+    RUN_TEST(test_autotype_types_again_until_the_host_acts);
+    RUN_TEST(test_autotype_stops_typing_into_a_mac_that_never_answers);
+    RUN_TEST(test_autotype_forgets_a_woken_match_nobody_claimed);
+    RUN_TEST(test_autotype_types_for_a_match_that_woke_a_sleeping_host);
+    RUN_TEST(test_autotype_wake_tap_is_left_shift_alone);
     RUN_TEST(test_autotype_presses_and_releases_keypad_digits_then_return);
     RUN_TEST(test_wake_line_is_believed_after_both_levels_and_reads_its_touched_level);
     return UNITY_END();

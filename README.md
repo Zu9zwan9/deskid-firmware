@@ -253,7 +253,9 @@ The board presents three USB interfaces: the CCID reader, a keyboard, and a vend
 swift tools/deskid_arm.swift 10   # arm for 10 s, then touch the ring
 ```
 
-Arming is a feature report on the vendor interface (usage page `0xFF00`, usage `1`, no report ID): `01`, then the seconds. Reading the report back returns `01`, the seconds the arming has left and the number of emissions since power-up.
+Arming is a feature report on the vendor interface (usage page `0xFF00`, usage `1`, no report ID): `01`, then the seconds. `02`, then the seconds, is the same request for a display that is asleep. Reading the report back returns `01`, the seconds the arming has left, the number of emissions since power-up and a status byte. Bit 0 of the status is set when the board understands `02`. Bit 1 is set when the wake line is trusted, so watching the ring costs no image captures and a host may keep the board armed. Bit 2 is set when the board understands `03`.
+
+`03` asks the board to leave the bus for half a second and come back. macOS hands an inserted card only to the driver that was registered when the card went in. After a driver is registered or updated the card stays dead for the system until it is reinserted: a prompt answers "SmartCard initialization error" and the lock screen ignores a touch, while direct access to the reader keeps working (measured three times on 2026-11-13). A host that has just registered a driver sends `03` and the board reinserts itself. The request ends any arming.
 
 Four rules bound it:
 
@@ -263,6 +265,12 @@ Four rules bound it:
 - Development builds only. `DESKID_ALLOW_AUTOTYPE` is set for `env:deskid`. Arming carries no authentication yet, so any local process can ask the board to type its constant after your next touch. A production image ignores the request.
 
 Each key is down for 30 ms and up for 30 ms (`kAutotypeReportMilliseconds`), about 0.4 s for the seven keys. `deskid::Autotype` holds the policy and `test/test_piv` tests it.
+
+Keys sent into a dark lock screen are lost. Armed with `02`, a match taps Left Shift and types nothing. The display wakes, the host sees a lit screen that is still locked and arms with `01`, and that arming types the digits 400 ms later (`kAutotypeLitMilliseconds`). The match waits 10 s for it (`kWokenMatchMilliseconds`). Zero seconds drops the match, so a Mac that something else unlocked in between gets no digits.
+
+macOS drops keys while a display comes up and reports nothing. Measured on 2026-11-13 on macOS 27.0.1 with an external monitor: the wake tap lit the display, digits typed 0.6 s to 1.0 s after it were lost, and the display took keys 2.0 s after the tap. So the digits are typed again every 2.2 s (`kRetypeMilliseconds`), at most twice (`kMaximumRetypes`), until the host asks the card for a private-key operation, which only a submitted PIN field causes.
+
+A Mac that is fully asleep suspends the bus and runs no helper, so nothing arms the board. A match then signals remote wakeup, taps Left Shift once the bus resumes, and is held for the `01` arming the same way. The configuration descriptor sets the remote wakeup bit for this. A board whose wake line is not trusted does not watch its ring while the Mac sleeps and cannot wake it.
 
 What to expect from macOS:
 
@@ -277,7 +285,9 @@ Measured on 2026-11-13 on macOS 27.0.1, on a `deskid` board with an R503:
 - Not armed: a touch matched and typed nothing.
 - The arming interface opened from a shell with no Input Monitoring request, and Keyboard Setup Assistant did not open.
 
-Not run yet: the lock screen, `sudo`, and an unenrolled finger while armed. No helper arms the board on its own, so `tools/deskid_arm.swift` is the trigger.
+- At the lock screen, with the card paired and a host process arming the board while the screen was locked and lit: one touch unlocked the Mac. The signature took 220 ms and the key agreement that followed took 201 ms.
+
+Not run yet: `sudo`, an unenrolled finger while armed, the `02` request on a sleeping display, and waking a Mac that is asleep. This repository has no helper that arms the board on its own, so `tools/deskid_arm.swift` is the trigger.
 
 ### Guided setup
 
@@ -474,7 +484,7 @@ With enforcement on, unplugging DeskID no longer returns the Mac to password log
 - The R503 password is 32 bits. It stops accidental access and fails against a determined physical attack.
 - Host provisioning leaves a copy of the private key under manufacturing control. `tools/provision.py --on-device` generates the key on the board. The NVS packaging step is still needed for the R503 password.
 - `80 F0` reboots the device into ROM download mode. It requires a fingerprint match and is absent from production builds. On development builds one match is enough to replace the firmware.
-- A development build types a constant PIN after a match when a host arms it ([Touch only](#touch-only)). Arming is unauthenticated: local software can make the board type that constant into the front window after your next touch. It cannot make the board sign, which still takes the match. Production builds ignore arming.
+- A development build types a constant PIN after a match when a host arms it ([Touch only](#touch-only)). Arming is unauthenticated: local software can make the board type that constant into the front window after your next touch. It cannot make the board sign, which still takes the match. The reinsert request is unauthenticated too: local software can take the reader off the bus for half a second, as often as it likes. Production builds ignore both.
 - Fingerprint templates stay inside the R503. `80 E1` enrolls without authorization while the sensor reports an empty library. Recovery from a lost finger needs a separate authenticated process, which does not exist yet.
 
 A high-assurance commercial device needs a reviewed secure element and a sensor link with cryptographic match attestation. The ESP32-S3 and R503 alone cannot give the physical-tamper guarantees of Touch ID.

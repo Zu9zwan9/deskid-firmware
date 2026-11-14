@@ -128,6 +128,14 @@ constexpr uint32_t kArmedScanMilliseconds = 250;
 // about 40 ms a key loses characters at the macOS login window (reports from
 // YubiKey users); tune it here if a board ever drops a digit.
 constexpr uint32_t kAutotypeReportMilliseconds = 30;
+// How long the digits wait once the host says a woken lock screen is lit.
+// The host goes by the display state, which leads the PIN field, and macOS
+// drops the first keys after a display wake (user reports on 15.2 and
+// 15.3.1). Tune it here if a board ever loses a digit after a wake.
+constexpr uint32_t kAutotypeLitMilliseconds = 400;
+// How long the board stays off the bus when a host asks it to reinsert
+// itself. Long enough for the host to see the reader go; a hand takes longer.
+constexpr uint32_t kReinsertMilliseconds = 500;
 constexpr uint8_t kMaximumArmSeconds = 120;
 // The R503's own default. Level 5 is the strictest of the five and was the
 // first choice here, but it rejected an enrolled finger often enough to be
@@ -1464,6 +1472,25 @@ deskid::Autotype g_autotype;
     deskid::sendKeyboardReport(report);
 }
 
+// Wakes the Mac: its display, and the Mac itself when the bus is suspended.
+[[maybe_unused]] void wakeMac() {
+    // A sleeping Mac takes no key reports. It is woken the way a key press
+    // on a sleeping keyboard wakes it, and the tap that follows is the user
+    // activity that lights the display.
+    if (deskid::wakeHost()) {
+        for (int wait = 0; wait < 100 && deskid::hostAsleep(); ++wait) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+    uint8_t report[8];
+    deskid::Autotype::wakeReport(true, report);
+    if (deskid::sendKeyboardReport(report)) {
+        vTaskDelay(pdMS_TO_TICKS(kAutotypeReportMilliseconds));
+    }
+    deskid::Autotype::wakeReport(false, report);
+    deskid::sendKeyboardReport(report);
+}
+
 // Owned by the idle scanner below, but also cleared by the gated path, which
 // drives the same ring and leaves the same finger resting on it.
 // Until when the host has asked the board to watch its own sensor.
@@ -1697,7 +1724,18 @@ void scanForEarlyTouch(R503Sensor &sensor, deskid::RateLimiter &limiter,
             // The touch is recorded first, so the login instruction the typed
             // Return sets off finds it. Typing takes longer than the flash.
             if (g_autotype.take(millisecondsSinceBoot())) {
-                typeDummyPin();
+                if (g_autotype.wakes()) {
+                    // The digits follow when the host says the screen is lit.
+                    wakeMac();
+                } else {
+                    typeDummyPin();
+                }
+            } else if (deskid::hostAsleep()) {
+                // No helper runs on a Mac that is asleep, so nothing armed
+                // the board. A match still wakes it, and is held for the
+                // arming that follows once the lock screen is lit.
+                wakeMac();
+                g_autotype.wokeHost(millisecondsSinceBoot());
             } else {
                 vTaskDelay(pdMS_TO_TICKS(250));
             }
@@ -1750,6 +1788,9 @@ bool authorizeFingerprint(R503Sensor &sensor, deskid::RateLimiter &limiter,
     return true;
 #else
     g_lastGateInstruction = request.apduLength > 1 ? request.apdu[1] : 0;
+    // Only a submitted PIN field makes macOS ask for this, so digits typed
+    // for a match that woke the Mac have landed.
+    g_autotype.hostActed();
     g_lastGateOutcome = 2;
     // A touch that already happened answers the login instructions with no
     // wait at all. It is spent here whether or not what follows succeeds, so
@@ -1962,18 +2003,35 @@ extern "C" void app_main() {
             // Nothing from the host, so the ring belongs to the user.
             const int64_t now = esp_timer_get_time();
             uint8_t autotypeSeconds = 0;
-            if (deskid::takeAutotypeArm(autotypeSeconds)) {
+            bool autotypeToWake = false;
+            if (deskid::takeAutotypeArm(autotypeSeconds, autotypeToWake)) {
                 const uint64_t nowMs = millisecondsSinceBoot();
-                g_autotype.arm(autotypeSeconds, nowMs);
+                if (g_autotype.arm(autotypeSeconds, nowMs, autotypeToWake)) {
+                    // A match woke the display, and the host now says the
+                    // lock screen is lit and still locked.
+                    vTaskDelay(pdMS_TO_TICKS(kAutotypeLitMilliseconds));
+                    typeDummyPin();
+                }
                 // An armed board has to be watching its ring, wake line or
                 // not.
                 g_ringArmedUntilMs = std::max<uint64_t>(
                     g_ringArmedUntilMs,
                     nowMs + g_autotype.secondsRemaining(nowMs) * 1000ULL);
             }
+            if (g_autotype.retype(millisecondsSinceBoot())) {
+                // The first digits met a display that was still coming up.
+                typeDummyPin();
+            }
+            if (deskid::takeReinsertRequest()) {
+                // The host has registered a new driver for the card. Whatever
+                // it armed belongs to the session that is about to end.
+                g_autotype.arm(0, millisecondsSinceBoot());
+                deskid::leaveAndRejoinBus(kReinsertMilliseconds);
+                continue;
+            }
             deskid::publishAutotypeStatus(
                 g_autotype.secondsRemaining(millisecondsSinceBoot()),
-                g_autotype.emissions());
+                g_autotype.emissions(), sensor.wakeLineUsable());
             if (sensor.state() == 2 && now >= nextRecovery) {
                 nextRecovery = now + 2000000;
                 sensor.recover();
