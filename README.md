@@ -282,7 +282,9 @@ The board presents three USB interfaces: the CCID reader, a keyboard, and a vend
 swift tools/deskid_arm.swift 10   # arm for 10 s, then touch the ring
 ```
 
-Arming is a feature report on the vendor interface (usage page `0xFF00`, usage `1`, no report ID): `01`, then the seconds. `02`, then the seconds, is the same request for a display that is asleep. Reading the report back returns `01`, the seconds the arming has left, the number of emissions since power-up and a status byte. Bit 0 of the status is set when the board understands `02`. Bit 1 is set when the wake line is trusted, so watching the ring costs no image captures and a host may keep the board armed.
+Arming is a feature report on the vendor interface (usage page `0xFF00`, usage `1`, no report ID): `01`, then the seconds. `02`, then the seconds, is the same request for a display that is asleep. Reading the report back returns `01`, the seconds the arming has left, the number of emissions since power-up and a status byte. Bit 0 of the status is set when the board understands `02`. Bit 1 is set when the wake line is trusted, so watching the ring costs no image captures and a host may keep the board armed. Bit 2 is set when the board understands `03`.
+
+`03` asks the board to leave the bus for half a second and come back. macOS hands an inserted card only to the driver that was registered when the card went in. After a driver is registered or updated the card stays dead for the system until it is reinserted: a prompt answers "SmartCard initialization error" and the lock screen ignores a touch, while direct access to the reader keeps working (measured three times on 2026-11-13). A host that has just registered a driver sends `03` and the board reinserts itself. The request ends any arming.
 
 Four rules bound it:
 
@@ -511,7 +513,7 @@ With enforcement on, unplugging DeskID no longer returns the Mac to password log
 - The R503 password is 32 bits. It stops accidental access and fails against a determined physical attack.
 - Host provisioning leaves a copy of the private key under manufacturing control. `tools/provision.py --on-device` generates the key on the board. The NVS packaging step is still needed for the R503 password.
 - `80 F0` reboots the device into ROM download mode. It requires a fingerprint match and is absent from production builds. On development builds one match is enough to replace the firmware.
-- A development build types a constant PIN after a match when a host arms it ([Touch only](#touch-only)). Arming is unauthenticated: local software can make the board type that constant into the front window after your next touch. It cannot make the board sign, which still takes the match. Production builds ignore arming.
+- A development build types a constant PIN after a match when a host arms it ([Touch only](#touch-only)). Arming is unauthenticated: local software can make the board type that constant into the front window after your next touch. It cannot make the board sign, which still takes the match. The reinsert request is unauthenticated too: local software can take the reader off the bus for half a second, as often as it likes. Production builds ignore both.
 - Fingerprint templates stay inside the R503. `80 E1` enrolls without authorization while the sensor reports an empty library. Recovery from a lost finger needs a separate authenticated process, which does not exist yet.
 
 A high-assurance commercial device needs a reviewed secure element and a sensor link with cryptographic match attestation. The ESP32-S3 and R503 alone cannot give the physical-tamper guarantees of Touch ID.
