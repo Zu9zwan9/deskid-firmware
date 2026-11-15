@@ -850,7 +850,8 @@ void RateLimiter::recordFailure(uint64_t nowMilliseconds) {
     if (locked(nowMilliseconds)) {
         return;
     }
-    if (++consecutiveFailures_ < failureThreshold_) {
+    // NIST SP 800-63B-4: past the first lockout every failure waits again.
+    if (lockoutCount_ == 0 && ++consecutiveFailures_ < failureThreshold_) {
         return;
     }
     consecutiveFailures_ = 0;

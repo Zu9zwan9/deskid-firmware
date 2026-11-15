@@ -112,7 +112,8 @@ constexpr uint8_t kFingerprintSecurityLevel = 3;
 // rejects ordinary touches that the gated path would have accepted.
 constexpr int kRetriesPerTouch = 3;
 constexpr uint32_t kFingerprintFailureThreshold = 5;
-constexpr uint64_t kFingerprintBaseLockoutMilliseconds = 15000;
+// NIST SP 800-63B-4: at least 30 s before each attempt past the fifth failure.
+constexpr uint64_t kFingerprintBaseLockoutMilliseconds = 30000;
 constexpr uint64_t kFingerprintMaximumLockoutMilliseconds = 900000;
 constexpr char kStorageNamespace[] = "deskid";
 constexpr char kCertificateKey[] = "piv_cert";
