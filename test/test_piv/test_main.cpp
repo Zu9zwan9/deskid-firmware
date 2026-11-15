@@ -908,6 +908,22 @@ void test_an_attempt_that_cannot_be_written_down_is_refused() {
     TEST_ASSERT_EQUAL_UINT32(1, limiter.consecutiveFailures());
 }
 
+// NIST SP 800-63B-4: after five failures in a row, every further attempt waits
+// at least 30 seconds. Five more free tries after each lockout would not.
+void test_every_failure_after_the_first_lockout_locks_again() {
+    deskid::RateLimiter limiter(5, 30000, 900000);
+    for (int i = 0; i < 5; ++i) {
+        limiter.recordFailure(0);
+    }
+    TEST_ASSERT_TRUE(limiter.locked(29999));
+    TEST_ASSERT_FALSE(limiter.locked(30000));
+
+    limiter.recordFailure(30000);
+    TEST_ASSERT_TRUE(limiter.locked(30000));
+    TEST_ASSERT_TRUE(limiter.locked(89999));
+    TEST_ASSERT_FALSE(limiter.locked(90000));
+}
+
 // "Zero templates" opens enrollment to anyone, so it has to be something the
 // sensor said, not the value a counter happens to start at.
 void test_enrollment_is_gated_while_the_template_count_is_unknown() {
@@ -1047,6 +1063,7 @@ int main(int, char **) {
     RUN_TEST(test_attempt_is_charged_before_the_verdict_and_survives_power_loss);
     RUN_TEST(test_a_match_clears_the_charge_and_says_so_on_disk);
     RUN_TEST(test_an_attempt_that_cannot_be_written_down_is_refused);
+    RUN_TEST(test_every_failure_after_the_first_lockout_locks_again);
     RUN_TEST(test_enrollment_is_gated_while_the_template_count_is_unknown);
     RUN_TEST(test_verify_expires_instead_of_waiting_for_a_signature);
     RUN_TEST(test_status_object_fits_the_longest_version_string);
